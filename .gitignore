@@ -1,0 +1,12 @@
+# runtime output
+__pycache__/
+*.pyc
+bridge/
+screenshots/
+exports/
+*.bak
+
+# downloaded or local-only data
+data/BlueprintFilter.txt
+data/*.json
+config.json
