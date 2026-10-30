@@ -117,6 +117,20 @@ def find_window(title=None):
     return (main or sorted(wins, key=lambda w: -(w["rect"][2] - w["rect"][0]) * (w["rect"][3] - w["rect"][1])))[0]
 
 
+def ui_scale(win):
+    """Editor UI pixels per layout pixel on the window's monitor (1.0 at 100% Windows scaling)."""
+    try:
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        monitor = user32.MonitorFromWindow(win["hwnd"], 2)
+        x, y = ctypes.c_uint(), ctypes.c_uint()
+        if ctypes.windll.shcore.GetDpiForMonitor(ctypes.c_void_p(monitor), 0, ctypes.byref(x), ctypes.byref(y)) == 0:
+            return x.value / 96.0
+    except (OSError, AttributeError):
+        pass
+    return 1.0
+
+
 def focus(win):
     h = win["hwnd"]
     if user32.IsIconic(h):

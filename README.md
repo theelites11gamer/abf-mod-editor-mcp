@@ -2,7 +2,7 @@
 
 An [MCP](https://modelcontextprotocol.io) server that lets an AI coding assistant (Claude Code, Codex, Cursor, anything that speaks MCP) drive the official **Abiotic Factor Mod Editor** — the free Unreal-based editor Deep Field Games ships through the Epic Games Launcher.
 
-With it, the assistant can open a mod, read and edit item/recipe/buff rows, create new rows copied from base-game ones, paste Blueprint graphs, compile, look at the editor through per-window screenshots, click and type in it, load a map, run Play In Editor, read the player's state, and check a mod against the same Blueprint filter the upload audit enforces — all from a chat.
+With it, the assistant can open a mod, read and edit item/recipe/buff rows, create new rows copied from base-game ones, build Blueprint graphs from a node list, compile and read the errors, look at the editor through per-window screenshots, click and type in it, load a map, run Play In Editor, read the player's state, and check a mod against the same Blueprint filter the upload audit enforces — all from a chat.
 
 Pure Python, no packages, Windows only (the editor is Windows only). Not affiliated with Deep Field Games, Playstack or mod.io.
 
@@ -39,16 +39,16 @@ The editor's Python plugin has a "remote execution" mode (UDP discovery on 239.0
 
 The server uses remote execution first and the bridge second, opens a fresh connection per command (so it can share the editor with other tools), and reports a command that was sent but got no reply instead of retrying it.
 
-## Tools (33)
+## Tools (37)
 
 | Group | Tools |
 | --- | --- |
 | Status and launch | `editor_status` (call first), `launch_editor`, `open_mod` (drives the picker's Browse… dialog, since the command line can't open a mod) |
 | Python | `run_python`, `evaluate_python`, `run_python_file` (`args` → `ARGS` inside the script) |
-| Mod data | `list_mods`, `list_mod_templates`, `find_assets`, `get_row`, `set_row` (plain values, Python expressions, or whole export text), `create_row_asset` (any of the 72 `*ModRowAsset` classes, optionally copied from a base-game row or another mod row), `delete_asset`, `save_assets`, `compile_blueprint`, `validate_assets` |
+| Mod data | `list_mods`, `list_mod_templates`, `find_assets`, `get_row`, `set_row` (plain values, Python expressions, or whole export text), `create_row_asset` (any of the 72 `*ModRowAsset` classes, optionally copied from a base-game row or another mod row), `delete_asset`, `save_assets`, `validate_assets` |
 | Base-game data | `get_game_row` — list or read any row the game exposes through its `<Kind>HandleFunctionLibrary` (gear_item, weapon_item, recipe, buff_debuff, npc, pet, trait, …) |
-| Blueprints | `paste_graph` (clipboard T3D → graph in one step), `inspect_blueprint` (parent, variables, graphs, every reference, errors, nodes and pins), `export_t3d`, `t3d_errors`, `blueprint_filter_check` |
-| Window | `editor_windows`, `editor_screenshot` (one editor window, returned as an image, works in the background), `editor_click`, `editor_keys`, `close_editor_window` |
+| Blueprints | `build_graph` (node list → graph, every pin checked against the editor), `discover_pins` (the real pins of any node), `paste_graph` (clipboard T3D → graph, then checks what arrived), `compile_blueprint` (reports the compiler's errors; a Blueprint with errors isn't saved), `inspect_blueprint` (parent, variables, graphs, every reference, errors, nodes and pins), `export_t3d`, `t3d_errors`, `blueprint_filter_check` |
+| Window | `open_asset`, `close_asset`, `editor_windows`, `editor_screenshot` (one editor window, returned as an image, works in the background), `editor_click`, `editor_keys`, `close_editor_window` |
 | Map and play | `load_map`, `play_in_editor` start/stop, `pie_info` (players, pawns, locations, chosen pawn properties), `console_command` (editor or game world) |
 | Release | `check_upload` (offline pre-upload check), `read_editor_log` |
 
@@ -64,26 +64,56 @@ The server uses remote execution first and the bridge second, opens a fresh conn
 
 The editor's **Upload Mod** zips the whole project folder and mod.io rejects some of what ends up inside (for instance any `.md` file, reported only as "Unknown ApiError"). The cloud cook then recompiles Blueprints without the editor-only assets, so a reference to something that exists only in the editor fails there. `check_upload` scans the folder for both, using the file lists in `data/` (names only, from game/editor version 1.5; see `data/make_editor_list.py`).
 
-The upload's Asset Audit checks Blueprint calls and variables against a filter list Deep Field publishes. `blueprint_filter_check` downloads that list (cached a day) and applies the same rules to a mod's Blueprints, naming each blocked call and the node it's on — before you find out one upload at a time.
+The upload's Asset Audit checks Blueprint calls and variables against a filter list Deep Field publishes. `blueprint_filter_check` downloads that list (cached a day) and applies it to a mod's Blueprints, naming each blocked call and the node it's on — before you find out one upload at a time. The rules apply through class inheritance: the list allows all of `Actor` and `ActorComponent`, so `AudioComponent.FadeOut` is fine, then blocks exceptions by name. This was compared with the editor's real audit: on a test Blueprint with 14 calls, both blocked the same 6 and allowed the same 8, and a real mod got 0 blocked from each. The audit reads the nodes, not the compiled code, so an unconnected blocked call still fails it.
 
 Neither replaces the editor's own checks; they catch the common failures early.
+
+## Building graphs
+
+Python can't create Blueprint nodes in this editor, so nodes go in as clipboard text (T3D). `build_graph` writes that text for you from a short list:
+
+```json
+{
+  "asset_path": "/MyMod/Blueprints/BP_MyActor",
+  "nodes": [
+    {"id": "begin", "type": "event", "owner": "/Script/Engine.Actor", "function": "ReceiveBeginPlay"},
+    {"id": "say", "owner": "/Script/Engine.KismetSystemLibrary", "function": "PrintString", "args": {"InString": "Hello"}}
+  ],
+  "links": [["begin.then", "say.execute"]],
+  "paste": true,
+  "compile": true
+}
+```
+
+It never guesses a pin. Each kind of node is first pasted bare into a throwaway Blueprint outside your mod, which is never saved and is deleted straight away, and the pins the editor allocates are the ones used. Answers about game and engine classes are kept in `data/node-templates.json`, so the next request for the same node is instant. A wrong pin name is an error that lists the real ones. After pasting it reads the Blueprint back and reports any node or link that didn't arrive.
+
+The result also lists anything the upload filter would block. For nodes `build_graph` has no type for, `raw` takes a node class and properties. `paste_graph` does the same pasting and checking for T3D you already have.
 
 ## Working notes
 
 - Mod row assets are `PrimaryDataAsset`s; `row_name` defaults to the asset name and the game adds the mod prefix at runtime.
-- Python can't create Blueprint nodes in this editor. Generate clipboard text (T3D) and use `paste_graph`, in passes: custom events must exist and be compiled before anything calls them, or the calls are dropped silently. Use a fresh node-name prefix per paste; deleted nodes linger in exports.
+- Paste in passes: custom events must exist and be compiled before anything calls them, or the calls are dropped. `build_graph` resolves a Blueprint's own functions by building its throwaway Blueprint as a child of the one you name, so the same rule applies there.
+- The editor drops every link of the last node in a paste. `paste_graph` and `build_graph` end each paste with a small comment node so that's never a real node; it's safe to delete.
+- Pasted nodes can't link to nodes already in the graph, like a function's entry node. Wire those in the editor, or with `editor_click` and `editor_keys`.
+- A call to a function the Blueprint doesn't have, pasted as raw T3D, opens a Fix Self Context Function References dialog that blocks the editor. `paste_graph` reports it under `dialogs`; close it with `close_editor_window`. `build_graph` names the class instead, so it gets an error and no dialog. Deletes never run through the file bridge, because that can happen behind a dialog and has crashed the editor.
+- A variable with an `owner` needs a target linked to its `self` pin. Leave the owner out for the Blueprint's own or inherited variables.
+- A pasted copy of an event that already exists in the graph, including a greyed-out default one, turns into a custom event that nothing calls. The paste report lists these under `changed_class`; delete the old event first, or paste with `clear`.
+- `clear` first pastes a marker comment and reads it back, so its Ctrl+A and Delete can only happen with a graph focused. On the Viewport tab they would delete components.
+- A new Blueprint opens on its Viewport tab and a widget on its Designer. `paste_graph` brings the Event Graph or Graph view forward when nothing arrives, using positions in the default window layout. For a function's graph, open its tab first.
+- T3D exports also hold deleted nodes and whole graphs the compiler generates. The tools count only live nodes in the graphs the Blueprint lists itself; `inspect_blueprint(include_deleted=true)` shows the rest.
 - A new mod project can't be created from Python (the template system has no entry point). Do it in the picker: ITEMS tile → template → name → Create. `editor_screenshot` + `editor_click`/`editor_keys` can drive it.
 - Loading a map opens the Message Log over the viewport; `close_editor_window("Message Log")` before Play In Editor.
 - The editor runs commands on its game thread: keep scripts short, and never open a modal dialog from one.
 
 ## Testing
 
-`python test_client.py` speaks MCP to the server over stdio and exercises the read-only tools against the open editor. `--bridge` forces the file-bridge transport. `--row <mod row asset> <mod folder>` also edits and restores a row, creates and deletes a row asset, and runs the two checkers. Use a throwaway copy of a mod for that.
+`python test_offline.py` needs no editor: filter rules, T3D parsing, paste checks and the graph builder. `python test_client.py` speaks MCP to the server over stdio and exercises the read-only tools against the open editor. `--bridge` forces the file-bridge transport. `--row <mod row asset> <mod folder>` also edits and restores a row, creates and deletes a row asset, and runs the two checkers. `--graph <mod root>` builds, pastes and compiles a throwaway Blueprint, taking the mouse and keyboard for a minute. Use a throwaway copy of a mod for the last two.
 
 ## Limits
 
 - Built against Mod Editor 1.5.0 (engine `5.4.4-1050002+++DF+ABF`, Python 3.11). A future editor update may change the Python API; the file lists in `data/` are versioned and will need regenerating after a game update.
 - Windows only.
+- Bringing the graph forward clicks positions in the default window layout, tested at 100% Windows display scaling. If they miss, `paste_graph` says nothing arrived, and a click on the tab from `editor_click` does the same job.
 - A mod made with these tools still has to pass the editor's Asset Audit and mod.io's cloud cook; the checkers here reduce surprises, they don't guarantee anything.
 
 ## License

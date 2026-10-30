@@ -14,6 +14,7 @@ No third-party packages. Run with any Python 3.9+:  python -I server.py
 """
 
 import base64
+import calendar
 import gzip
 import json
 import os
@@ -30,10 +31,11 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import wininput  # noqa: E402
 import bpscan    # noqa: E402
+import graphbuild  # noqa: E402
 import paths     # noqa: E402
 
 SERVER_NAME = "abiotic-mod-editor"
-SERVER_VERSION = "2.2.0"
+SERVER_VERSION = "2.3.0"
 
 EDITOR_ROOT = paths.find_editor_root()          # None when no Mod Editor install was found
 EDITOR_EXE = paths.editor_exe(EDITOR_ROOT)
@@ -274,8 +276,12 @@ def bridge_run(payload, timeout):
 REMOTE = RemoteExecution()
 
 
-def execute(code=None, mode="exec", timeout=120.0, script=None, script_args=None):
-    """Run Python in the editor via remote execution, falling back to the file bridge."""
+def execute(code=None, mode="exec", timeout=120.0, script=None, script_args=None, remote_only=False):
+    """Run Python in the editor via remote execution, falling back to the file bridge.
+
+    remote_only: no fallback. Remote execution stops answering while a modal dialog is open, but the bridge keeps
+    running behind the dialog, and deleting an asset there has crashed the editor.
+    """
     reasons = []
     if script is None:
         remote_cmd, remote_mode = code, ("EvaluateStatement" if mode == "eval" else "ExecuteFile")
@@ -288,6 +294,9 @@ def execute(code=None, mode="exec", timeout=120.0, script=None, script_args=None
             return REMOTE.run(remote_cmd, remote_mode, timeout)
         except NotSent as e:
             reasons.append(f"remote execution: {e}")
+            if remote_only:
+                raise RemoteError("The editor isn't answering, so this was not run. A dialog is probably open: close it and try again. "
+                                  f"Windows: {[w['title'] for w in wininput.editor_windows()]}")
     payload = {"mode": mode, "args": script_args or {}}
     payload.update({"code": code} if script is None else {"script": str(script)})
     try:
@@ -314,7 +323,7 @@ def format_result(r):
     return "\n".join(parts), not r["success"]          # (text, is_error)
 
 
-def run_json(body, args=None, timeout=120.0):
+def run_json(body, args=None, timeout=120.0, remote_only=False):
     """Run a snippet that defines `def _abf(args): ...` in the editor and return its JSON result."""
     code = (
         "import unreal, json\n"
@@ -322,7 +331,7 @@ def run_json(body, args=None, timeout=120.0):
         f"_abf_args = json.loads({json.dumps(json.dumps(args or {}))})\n"
         f"print({JSON_MARKER!r} + json.dumps(_abf(_abf_args), default=str))\n"
     )
-    r = execute(code, timeout=timeout)
+    r = execute(code, timeout=timeout, remote_only=remote_only)
     for line in (r.get("output") or "").splitlines():
         idx = line.find(JSON_MARKER)
         if idx >= 0:
@@ -501,12 +510,9 @@ PY_COMPILE = r'''
 def _abf(args):
     bp = unreal.load_asset(args["asset_path"])
     if bp is None:
-        return {"error": "asset not found"}
+        return {"error": "asset not found: " + args["asset_path"]}
     unreal.BlueprintEditorLibrary.compile_blueprint(bp)
-    saved = None
-    if args.get("save", True):
-        saved = unreal.EditorAssetLibrary.save_loaded_asset(bp, only_if_is_dirty=False)
-    return {"blueprint": bp.get_path_name(), "saved": saved}
+    return {"blueprint": bp.get_path_name()}
 '''
 
 PY_VALIDATE = r'''
@@ -520,15 +526,10 @@ def _abf(args):
     reg = unreal.AssetRegistryHelpers.get_asset_registry()
     datas = [reg.get_asset_by_object_path(p + "." + p.rsplit("/", 1)[-1]) for p in paths]
     sub = unreal.get_editor_subsystem(unreal.EditorValidatorSubsystem)
-    settings = unreal.ValidateAssetsSettings()
-    settings.set_editor_property("show_if_no_failures", False)
-    results = unreal.ValidateAssetsResults()
-    sub.validate_assets_with_settings(datas, settings, results)
-    return {"checked": results.get_editor_property("num_checked"),
-            "valid": results.get_editor_property("num_valid"),
-            "invalid": results.get_editor_property("num_invalid"),
-            "warnings": results.get_editor_property("num_warnings"),
-            "skipped": results.get_editor_property("num_skipped")}
+    failures, _settings, results = sub.validate_assets_with_settings(datas)
+    report = {k: getattr(results, "num_" + k, None) for k in ("requested", "checked", "valid", "invalid", "warnings", "skipped")}
+    report["failures"] = failures
+    return report
 '''
 
 PY_EXPORT_T3D = r'''
@@ -694,6 +695,95 @@ def _abf(args):
     return {"deleted": unreal.EditorAssetLibrary.delete_asset(path), "asset": path}
 '''
 
+PY_OPEN_ASSET = r'''
+def _abf(args):
+    asset = unreal.load_asset(args["asset_path"])
+    if asset is None:
+        return {"error": "asset not found: " + args["asset_path"]}
+    unreal.get_editor_subsystem(unreal.AssetEditorSubsystem).open_editor_for_assets([asset])
+    return {"asset": asset.get_path_name(), "name": asset.get_name(), "class": asset.get_class().get_name(),
+            "widget": isinstance(asset, unreal.WidgetBlueprint)}
+'''
+
+PY_CLOSE_ASSET = r'''
+def _abf(args):
+    asset = unreal.load_asset(args["asset_path"])
+    if asset is None:
+        return {"error": "asset not found: " + args["asset_path"]}
+    unreal.get_editor_subsystem(unreal.AssetEditorSubsystem).close_all_editors_for_asset(asset)
+    return {"closed": asset.get_path_name()}
+'''
+
+PY_ASSET_BY_NAME = PY_MOD_ROOTS + r'''
+def _abf(args):
+    reg = unreal.AssetRegistryHelpers.get_asset_registry()
+    hits = []
+    for root in _mod_roots():
+        for ad in reg.get_assets_by_path(root, recursive=True):
+            if str(ad.asset_name) == args["name"]:
+                hits.append(str(ad.package_name))
+    return {"assets": hits}
+'''
+
+# Parents of a class, nearest first. A Blueprint class's Python type is its nearest native parent, which is all the filter needs.
+PY_CLASS_CHAINS = r'''
+def _abf(args):
+    out = {}
+    for path in args["classes"]:
+        try:
+            cls = unreal.load_class(None, path)
+        except Exception:
+            cls = None
+        if cls is None:
+            out[path] = None
+            continue
+        chain = []
+        for t in unreal.get_type_from_class(cls).__mro__:
+            sc = getattr(t, "static_class", None)
+            if sc is None:
+                continue
+            try:
+                name = sc().get_path_name()
+            except Exception:
+                continue
+            if name != path and name not in chain:
+                chain.append(name)
+        out[path] = chain
+    return out
+'''
+
+# A throwaway Blueprint: never saved and outside the mod, so it can't ship. /Temp is refused as an asset path here.
+PY_PROBE_CREATE = r'''
+def _abf(args):
+    parent = None
+    if args.get("parent_asset"):
+        bp = unreal.load_asset(args["parent_asset"])
+        if bp is not None:
+            parent = unreal.BlueprintEditorLibrary.generated_class(bp)
+    if parent is None and args.get("parent_class"):
+        parent = unreal.load_class(None, args["parent_class"])
+    if parent is None:
+        parent = unreal.Actor.static_class()
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+    widget = unreal.MathLibrary.class_is_child_of(parent, unreal.UserWidget.static_class())
+    factory = unreal.WidgetBlueprintFactory() if widget else unreal.BlueprintFactory()
+    factory.set_editor_property("parent_class", parent)
+    asset = tools.create_asset(args["name"], "/Engine/Transient", unreal.WidgetBlueprint if widget else unreal.Blueprint, factory)
+    if asset is None:
+        return {"error": "could not create a probe Blueprint with parent " + parent.get_path_name()}
+    unreal.get_editor_subsystem(unreal.AssetEditorSubsystem).open_editor_for_assets([asset])
+    return {"asset": asset.get_outermost().get_name(), "parent": parent.get_path_name(), "widget": widget}
+'''
+
+PY_PROBE_REMOVE = r'''
+def _abf(args):
+    asset = unreal.load_asset(args["asset_path"])
+    if asset is None:
+        return {"removed": False}
+    unreal.get_editor_subsystem(unreal.AssetEditorSubsystem).close_all_editors_for_asset(asset)
+    return {"removed": bool(unreal.EditorAssetLibrary.delete_asset(args["asset_path"]))}
+'''
+
 
 # ---------------------------------------------------------------------------
 # Offline helpers
@@ -777,20 +867,71 @@ def check_upload(mod_dir):
 
 
 def t3d_errors(text, prefix=None):
-    nodes, problems = 0, []
-    for m in re.finditer(r'Begin Object Class=([^\s]+) Name="([^"]+)"(.*?)\n\s*End Object', text, re.S):
-        cls, name, body = m.group(1), m.group(2), m.group(3)
-        if "Node" not in cls.split(".")[-1]:
-            continue
-        if prefix and not name.startswith(prefix):
-            continue
-        nodes += 1
-        err = re.search(r'ErrorMsg="(.*)"', body)
-        orphan = re.findall(r'PinName="([^"]+)"[^\n]*bOrphanedPin=True', body)
-        if err or orphan:
-            problems.append({"node": name, "class": cls.split(".")[-1],
-                             "error": err.group(1)[:300] if err else None, "orphaned_pins": orphan})
-    return {"nodes_checked": nodes, "problems": problems}
+    parsed = bpscan.parse_t3d(text)
+    nodes = [n for n in parsed["nodes"] if not prefix or n["name"].startswith(prefix)]
+    problems = [{"node": n["name"], "class": n["class"], "graph": n.get("graph"), "error": n.get("error"),
+                 "orphaned_pins": n.get("orphaned_pins", [])}
+                for n in nodes if n.get("error") or n.get("orphaned_pins")]
+    warnings = [{"node": n["name"], "graph": n.get("graph"), "warning": n["warning"]} for n in nodes if n.get("warning")]
+    return {"nodes_checked": len(nodes), "deleted_or_generated_nodes_ignored": parsed["dead_nodes"], "problems": problems, "warnings": warnings}
+
+
+# ---- editor log -------------------------------------------------------------
+# The log grows past 100 MB in a long session, so it's read from the end, a block at a time.
+
+LOG_STAMP = re.compile(r"^\[(\d{4})\.(\d\d)\.(\d\d)-(\d\d)\.(\d\d)\.(\d\d):")
+
+
+def log_file(name=None):
+    """The named log, or the one the running editor writes: a second editor instance uses AbioticFactor_2.log."""
+    folder = SAVED_DIR / "Logs"
+    if name:
+        return folder / name
+    current = [p for p in folder.glob("AbioticFactor*.log") if "-backup-" not in p.name]
+    return max(current, key=lambda p: p.stat().st_mtime) if current else folder / "AbioticFactor.log"
+
+
+def log_mark():
+    """(file, size): where the log ends now, for log_since."""
+    path = log_file()
+    return path, path.stat().st_size if path.is_file() else 0
+
+
+def log_since(mark):
+    """Complete lines written after log_mark()."""
+    path, offset = mark
+    if not path.is_file():
+        return []
+    with open(path, "rb") as f:
+        f.seek(offset)
+        data = f.read()
+    return data.decode("utf-8", "replace").splitlines()
+
+
+def tail_log(path, want, rx=None, since=None, max_bytes=64 << 20):
+    """Newest `want` matching lines, oldest first. Returns (lines, whole file searched?). since: a UTC epoch."""
+    out = []
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        pos, scanned, partial = f.tell(), 0, b""
+        while pos > 0 and len(out) < want and scanned < max_bytes:
+            step = min(1 << 20, pos)
+            pos -= step
+            scanned += step
+            f.seek(pos)
+            lines = (f.read(step) + partial).split(b"\n")
+            partial = lines.pop(0) if pos > 0 else b""
+            for raw in reversed(lines):
+                line = raw.decode("utf-8", "replace").rstrip("\r")
+                if since is not None:
+                    m = LOG_STAMP.match(line)
+                    if m and calendar.timegm(tuple(int(v) for v in m.groups())) < since:
+                        return list(reversed(out)), True
+                if line and (rx is None or rx.search(line)):
+                    out.append(line)
+                    if len(out) >= want:
+                        break
+    return list(reversed(out)), pos == 0 or len(out) >= want
 
 
 # ---------------------------------------------------------------------------
@@ -969,12 +1110,38 @@ def t_save_assets(args):
     return _json(run_json(PY_SAVE, args))
 
 
+def compile_blueprint(path, save=True, save_on_error=False):
+    """Compile and report what the compiler said. A Blueprint with errors isn't saved unless asked."""
+    mark = log_mark()
+    r = run_json(PY_COMPILE, {"asset_path": path}, timeout=300)
+    if r.get("error"):
+        return r
+    time.sleep(0.8)                 # the log file is written a moment after the compile
+    name = path.rsplit("/", 1)[-1]
+    errors, warnings = [], []
+    for line in log_since(mark):
+        if "[Compiler]" in line and name in line:
+            text = line.split("[Compiler]", 1)[1].strip()
+            (errors if "Error:" in line.split("[Compiler]", 1)[0] else warnings).append(text)
+    r.update(ok=not errors, errors=errors, warnings=warnings)
+    if save and (r["ok"] or save_on_error):
+        r["saved"] = bool(run_json(PY_SAVE, {"asset_paths": [path]}).get(path))
+    else:
+        r["saved"] = False
+    return r
+
+
 def t_compile_blueprint(args):
-    return _json(run_json(PY_COMPILE, args))
+    r = compile_blueprint(args["asset_path"], args.get("save", True), bool(args.get("save_on_error")))
+    return json.dumps(r, indent=2), not r.get("ok")
 
 
 def t_validate_assets(args):
-    return json.dumps(run_json(PY_VALIDATE, args, timeout=300), indent=2, default=str)
+    mark = log_mark()
+    r = run_json(PY_VALIDATE, args, timeout=300)
+    time.sleep(0.5)
+    r["messages"] = [l for l in log_since(mark) if re.search(r"(LogContentValidation|AssetCheck|DataValidation): (Error|Warning)", l)][-40:]
+    return json.dumps(r, indent=2, default=str), bool(r.get("invalid"))
 
 
 def t_export_t3d(args):
@@ -1060,15 +1227,52 @@ def t_keys(args):
     return f"Sent to '{win['title']}': {done}"
 
 
-def t_paste_graph(args):
-    text = args.get("text") or Path(args["file"]).read_text(encoding="utf-8-sig")
-    win = _window(args)
-    x, y = _scaled(win, args) if "x" in args else (600, 640)
-    wininput.set_clipboard(text)
+def asset_window(name):
+    """The asset editor window for this asset name, if it has its own."""
+    wins = [w for w in wininput.editor_windows() if name.lower() in w["title"].lower() and "Unreal Editor" not in w["title"]]
+    exact = [w for w in wins if w["title"].rstrip("*").strip().lower() == name.lower()]
+    return (exact or wins or [None])[0]
+
+
+def open_asset_window(path, wait=20.0):
+    """Open an asset's editor; returns (window, info). A user setting can dock editors in the main window instead."""
+    info = run_json(PY_OPEN_ASSET, {"asset_path": path}, timeout=120)
+    if info.get("error"):
+        raise RemoteError(info["error"])
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        win = asset_window(info["name"])
+        if win:
+            return win, info
+        time.sleep(0.3)
+    return wininput.find_window(), info
+
+
+def graph_point(win, widget=False):
+    """A window pixel on empty graph: past the greyed-out default events in the middle of the panel, because a click on
+    one of their comment bubbles would paste the text into the comment. A widget's graph panel is wider."""
+    l, t, r, b = win["rect"]
+    return int((r - l) * (0.80 if widget else 0.68)), int((b - t) * 0.40)
+
+
+def show_event_graph(win, widget=False):
+    """A new Blueprint opens on its Viewport tab and a widget on its Designer, so bring the graph forward. These are
+    positions in the default layout. A click up there can't change anything, and callers check by reading the Blueprint back."""
+    s = wininput.ui_scale(win)
+    width = win["rect"][2] - win["rect"][0]
+    if widget:
+        wininput.click(win, int(width - 62 * s), int(80 * s))         # the Graph button, top right
+    else:
+        wininput.click(win, int(width * 0.15 + 394 * s), int(118 * s))  # the Event Graph tab, right of the left column
+    time.sleep(0.8)
+
+
+def paste_into(win, text, x, y, clear=False, settle=3.0):
     # One process for click, select-all, delete and paste, so the graph keeps keyboard focus.
+    wininput.set_clipboard(text)
     wininput.click(win, x, y)
     time.sleep(0.5)
-    if args.get("clear"):
+    if clear:
         wininput.keys("ctrl+a")
         time.sleep(0.6)
         wininput.keys("delete")
@@ -1076,9 +1280,291 @@ def t_paste_graph(args):
         wininput.click(win, x, y)
         time.sleep(0.4)
     wininput.keys("ctrl+v")
-    time.sleep(float(args.get("settle_seconds", 3)))
-    return (f"Pasted {len(text)} chars into '{win['title']}' at ({x}, {y}). Compile, then check with "
-            "export_t3d(node_prefix=...) - calls to functions that don't exist yet are dropped silently.")
+    time.sleep(settle)
+
+
+def window_titles():
+    return {w["title"] for w in wininput.editor_windows()}
+
+
+def new_dialogs(before):
+    """Windows that appeared since `before`: a paste can open one, like Fix Self Context Function References for a call
+    to a function the Blueprint doesn't have. It blocks the editor until someone answers it."""
+    return sorted(window_titles() - before - {"Message Log"})
+
+
+DIALOG_OPEN = ("The paste opened a dialog, which blocks the editor until it's answered. Read it with editor_screenshot, then close it with "
+               "close_editor_window. A call to a function the Blueprint doesn't have does this: paste and compile the function first.")
+NOTHING_ARRIVED = ("None of the nodes arrived, even with the Event Graph brought forward. Check the window with editor_screenshot: a graph has to be "
+                   "showing (a data-only Blueprint needs 'Open Full Blueprint Editor' first), then pass x/y on empty graph.")
+
+
+def paste_checked(text, asset=None, win=None, xy=None, clear=False, settle=3.0, end_comment=True, compile_it=False, save=True):
+    """Paste clipboard text, then read the Blueprint back and report what actually arrived. (report, is_error)"""
+    if end_comment:
+        text, _ = graphbuild.ensure_end_comment(text)
+    check = graphbuild.lint(text)
+    report = {"lint_warnings": check["warnings"]}
+    if check["errors"]:
+        report.update(ok=False, pasted=False, lint_errors=check["errors"])
+        return report, True
+    if asset is None and win is not None and "Unreal Editor" not in win["title"]:
+        hits = run_json(PY_ASSET_BY_NAME, {"name": win["title"].rstrip("*").strip()}, timeout=60)["assets"]
+        asset = hits[0] if len(hits) == 1 else None
+    widget = False
+    if asset:
+        opened, info = open_asset_window(asset)
+        win, widget = win or opened, info["widget"]
+    elif win is None:
+        win = wininput.find_window()
+    x, y = xy or graph_point(win, widget)
+    report.update(window=win["title"], at=[x, y])
+    if not asset:
+        if clear:
+            report.update(ok=False, pasted=False, note="clear needs asset_path: without it, nothing can confirm a graph has focus before Ctrl+A and Delete.")
+            return report, True
+        paste_into(win, text, x, y, settle=settle)
+        report.update(ok=None, pasted=True, verified=False, note="Pasted but not checked: pass asset_path so the result can be read back.")
+        return report, False
+
+    def attempt(body, wait):
+        """Paste and read back. If nothing arrived the graph wasn't showing, so bring it forward once and try again."""
+        titles = window_titles()
+        paste_into(win, body, x, y, settle=wait)
+        dialogs = new_dialogs(titles)
+        if dialogs:
+            return {"nodes_found": 0, "ok": False, "dialogs": dialogs}
+        result = graphbuild.verify(body, export_mod_t3d(asset))
+        if not result["nodes_found"] and not xy:
+            show_event_graph(win, widget)
+            paste_into(win, body, x, y, settle=wait)
+            result = graphbuild.verify(body, export_mod_t3d(asset))
+            result["brought_graph_forward"] = True
+        return result
+
+    before = bpscan.parse_t3d(export_mod_t3d(asset))
+    if clear:
+        marker = attempt(graphbuild.comment_block(), 1.0)
+        if not marker["nodes_found"]:
+            report.update(ok=False, pasted=False, hint=DIALOG_OPEN if marker.get("dialogs") else NOTHING_ARRIVED, dialogs=marker.get("dialogs", []))
+            return report, True
+        # The marker landed, so a graph has focus: Ctrl+A and Delete can't reach components on the Viewport tab.
+        wininput.keys("ctrl+a")
+        time.sleep(0.6)
+        wininput.keys("delete")
+        time.sleep(0.8)
+    result = attempt(text, settle)
+    report.update(result, pasted=True, chars=len(text))
+    if result.get("dialogs"):
+        report.update(verified=False, hint=DIALOG_OPEN)
+        return report, True
+    report["verified"] = True
+    sent = {n["name"] for n in bpscan.parse_t3d(text)["nodes"]}
+    reused = sorted({n["name"] for n in before["nodes"]} & sent)
+    if reused and not clear:
+        report["note"] = (f"{len(reused)} node names were already in the Blueprint, so the editor renamed the new copies and they read as "
+                          "missing. Use a new node-name prefix for each paste (build_graph does).")
+    if not result["nodes_found"]:
+        report["hint"] = NOTHING_ARRIVED
+    is_error = not result["ok"]
+    if compile_it and result["ok"]:
+        c = compile_blueprint(asset, save)
+        report["compile"] = c
+        is_error = not c.get("ok")
+        if not c.get("ok"):
+            report["compile_node_problems"] = t3d_errors(export_mod_t3d(asset))["problems"]
+    return report, is_error
+
+
+def t_paste_graph(args):
+    text = args.get("text") or Path(args["file"]).read_text(encoding="utf-8-sig")
+    win = _window(args) if args.get("window") else None
+    xy = None
+    if "x" in args and "y" in args:
+        win = win or (open_asset_window(args["asset_path"])[0] if args.get("asset_path") else wininput.find_window())
+        xy = _scaled(win, args)
+    report, is_error = paste_checked(text, args.get("asset_path"), win, xy, bool(args.get("clear")), float(args.get("settle_seconds", 3)),
+                                     args.get("end_comment", True), bool(args.get("compile")), args.get("save", True))
+    return json.dumps(report, indent=2), is_error
+
+
+def t_open_asset(args):
+    win, info = open_asset_window(args["asset_path"], float(args.get("wait_seconds", 20)))
+    if args.get("show_graph"):
+        show_event_graph(win, info["widget"])
+    return json.dumps({"asset": info["asset"], "class": info["class"], "window": win["title"],
+                       "docked_in_main_window": "Unreal Editor" in win["title"], "graph_point": graph_point(win, info["widget"])}, indent=2)
+
+
+def t_close_asset(args):
+    return _json(run_json(PY_CLOSE_ASSET, args, timeout=60))
+
+
+# ---- building graphs from a node list ------------------------------------------
+
+def editor_build():
+    """Identifies the installed editor, so templates from an older build aren't reused."""
+    try:
+        bv = json.loads((EDITOR_ROOT / "Engine" / "Build" / "Build.version").read_text(encoding="utf-8-sig"))
+        return f"{bv.get('MajorVersion')}.{bv.get('MinorVersion')}.{bv.get('PatchVersion')}-{bv.get('Changelist')}"
+    except (OSError, ValueError, TypeError):
+        return "unknown"
+
+
+TEMPLATES = DATA / "node-templates.json"
+
+
+def load_templates():
+    build = editor_build()
+    try:
+        saved = json.loads(TEMPLATES.read_text(encoding="utf-8"))
+        if saved.get("build") == build:
+            return saved["nodes"]
+    except (OSError, ValueError, KeyError):
+        pass
+    return {}
+
+
+def save_templates(nodes):
+    TEMPLATES.parent.mkdir(exist_ok=True)
+    TEMPLATES.write_text(json.dumps({"build": editor_build(), "nodes": nodes}), encoding="utf-8")
+
+
+def probe_nodes(nodes, parent_asset=None, parent_class=None):
+    """Paste nodes bare into a throwaway Blueprint and read back what the editor allocated: {template key: template}."""
+    run = "McpProbe" + uuid.uuid4().hex[:8]
+    items, keys = [], {}
+    for n in nodes:
+        key = graphbuild.template_key(n)
+        if key not in keys:
+            keys[key] = f"{run}_{len(items)}"
+            items.append((keys[key], n))
+    info = run_json(PY_PROBE_CREATE, {"name": "BP_" + run, "parent_asset": parent_asset, "parent_class": parent_class}, timeout=120)
+    if info.get("error"):
+        raise RemoteError(info["error"])
+    removable = True
+    try:
+        deadline = time.time() + 20
+        win = None
+        while win is None and time.time() < deadline:
+            win = asset_window("BP_" + run)
+            time.sleep(0.3)
+        if win is None:
+            raise RemoteError("The throwaway Blueprint's window didn't appear.")
+        show_event_graph(win, info["widget"])
+        text, _ = graphbuild.ensure_end_comment(graphbuild.bare_text(items))
+        titles = window_titles()
+        # Clearing removes the default events: a pasted copy of one would turn into a custom event.
+        paste_into(win, text, *graph_point(win, info["widget"]), clear=True, settle=1.5 + len(items) * 0.03)
+        dialogs = new_dialogs(titles)
+        if dialogs:
+            removable = False       # deleting behind a dialog crashes the editor; the probe isn't saved, so it can stay
+            raise RemoteError(f"Reading these nodes opened a dialog: {dialogs}. {DIALOG_OPEN}")
+        export = export_mod_t3d(info["asset"])
+        arrived = [n for n in bpscan.parse_t3d(export)["nodes"] if n["class"] == "EdGraphNode_Comment" and n.get("graph") == "EventGraph"]
+        if not arrived:         # the end comment always pastes, so this is the window and not the nodes
+            raise RemoteError("Couldn't paste into the throwaway Blueprint's Event Graph: its window may not use the default layout. "
+                              "Reset it with Window > Load Layout > Default Editor Layout, or pass full pins with type 'raw'.")
+        found = graphbuild.templates_from_export(export, [name for name, _ in items])
+    finally:
+        if removable:
+            run_json(PY_PROBE_REMOVE, {"asset_path": info["asset"]}, timeout=60, remote_only=True)
+    return {key: found.get(name) for key, name in keys.items()}
+
+
+def templates_for(nodes, parent_asset=None, parent_class=None):
+    """({node id: template}, how many nodes needed the editor)."""
+    saved = load_templates()
+    need = [n for n in nodes if not (graphbuild.is_stable(n) and graphbuild.template_key(n) in saved)]
+    fresh = probe_nodes(need, parent_asset, parent_class) if need else {}
+    if any(graphbuild.is_stable(n) and fresh.get(graphbuild.template_key(n)) for n in need):
+        for n in need:
+            key = graphbuild.template_key(n)
+            if graphbuild.is_stable(n) and fresh.get(key):
+                saved[key] = fresh[key]
+        save_templates(saved)
+    return {n["id"]: fresh.get(graphbuild.template_key(n)) or saved.get(graphbuild.template_key(n)) for n in nodes}, len(need)
+
+
+def named_nodes(nodes, asset=None):
+    """Copies of the spec nodes, with an id on each. A call with no owner means the Blueprint's own function, and names
+    that class outright: a self-context call to a function that isn't there opens a dialog that blocks the editor."""
+    out = []
+    for i, n in enumerate(nodes):
+        n = dict(n, id=n.get("id") or f"n{i}")
+        if not n.get("owner") and n.get("function") and n.get("type", "call") == "call":
+            if not asset:
+                raise graphbuild.SpecError(f"node {n['id']!r}: a call with no owner is the Blueprint's own function: pass asset_path, or give an owner.")
+            name = asset.rstrip("/").rsplit("/", 1)[-1]
+            n["owner"] = f"{asset}.{name}_C"
+        out.append(n)
+    return out
+
+
+def t_discover_pins(args):
+    try:
+        nodes = named_nodes(args["nodes"], args.get("asset_path"))
+        for n in nodes:
+            graphbuild.describe(n)
+    except graphbuild.SpecError as e:
+        return str(e), True
+    templates, probed = templates_for(nodes, args.get("asset_path"), args.get("parent_class"))
+    out = []
+    for n in nodes:
+        t = templates.get(n["id"])
+        if t is None:
+            out.append({"id": n["id"], "error": "The editor refused this node: wrong class for that function, or it doesn't exist."})
+        else:
+            e = {"id": n["id"], "class": t["class"], "pins": graphbuild.pin_table(t)}
+            if t.get("error"):
+                e["error"] = t["error"]
+            out.append(e)
+    return json.dumps({"nodes": out, "asked_editor_for": probed}, indent=2), any("pins" not in e for e in out)
+
+
+def blocked_calls(text):
+    """What the upload filter would block in this clipboard text."""
+    rules, _ = bpscan.load_filter()
+    nodes = bpscan.parse_t3d(text)["nodes"]
+    chains = class_chains(bpscan.classes_used(nodes))
+    return [{"class": b["parent"], "member": b["member"], "rule": b["rule"]} for b in bpscan.check_nodes(nodes, rules, chains)["blocked"]]
+
+
+def t_build_graph(args):
+    spec = {}
+    if args.get("spec_file"):
+        spec = json.loads(Path(args["spec_file"]).read_text(encoding="utf-8-sig"))
+    links = args.get("links") or spec.get("links") or []
+    if not (args.get("nodes") or spec.get("nodes")):
+        return "Pass nodes (and links), or spec_file: a JSON file holding both.", True
+    if args.get("paste") and not args.get("asset_path"):
+        return "paste=true needs asset_path, the Blueprint to paste into.", True
+    prefix = args.get("prefix") or "G" + format(int(time.time()) % 36 ** 6, "x").upper()
+    try:
+        nodes = named_nodes(args.get("nodes") or spec.get("nodes"), args.get("asset_path"))
+        for n in nodes:
+            graphbuild.describe(n)
+    except graphbuild.SpecError as e:
+        return str(e), True
+    templates, probed = templates_for(nodes, args.get("asset_path"), args.get("parent_class"))
+    built = graphbuild.assemble(nodes, links, templates, prefix)
+    report = {"prefix": prefix, "nodes": len(nodes), "links": built["links"], "asked_editor_for": probed,
+              "problems": built["problems"], "warnings": built["warnings"]}
+    if built["problems"]:
+        report["ok"] = False
+        return json.dumps(report, indent=2), True
+    out = Path(args.get("out_file") or (HERE / "exports" / "graphs" / f"{prefix}.t3d"))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(built["text"], encoding="utf-8")
+    report.update(file=str(out), node_names=built["names"], blocked_by_upload_filter=blocked_calls(built["text"]))
+    if not args.get("paste"):
+        report["ok"] = True
+        return json.dumps(report, indent=2), False
+    pasted, is_error = paste_checked(built["text"], args["asset_path"], clear=bool(args.get("clear")),
+                                     compile_it=bool(args.get("compile")), save=args.get("save", True))
+    report["paste"] = pasted
+    report["ok"] = not is_error
+    return json.dumps(report, indent=2), is_error
 
 
 def t_play_in_editor(args):
@@ -1099,7 +1585,7 @@ def t_play_in_editor(args):
     return "Sent Alt+P but no game world appeared. Is a map loaded (not 'Empty')? Is a dialog or the Message Log in the way?", True
 
 
-def _export_mod_t3d(path):
+def export_mod_t3d(path):
     if path.startswith("/Game/"):
         raise RemoteError("Refusing: T3D-exporting a /Game Blueprint crashed this editor before. Export mod assets only.")
     out = HERE / "exports" / (path.strip("/").replace("/", "_") + ".t3d")
@@ -1111,13 +1597,13 @@ def _export_mod_t3d(path):
 
 
 def t_inspect_blueprint(args):
-    parsed = bpscan.parse_t3d(_export_mod_t3d(args["asset_path"]))
+    parsed = bpscan.parse_t3d(export_mod_t3d(args["asset_path"]), include_dead=bool(args.get("include_deleted")))
     nodes = parsed["nodes"]
     if args.get("graph"):
         nodes = [n for n in nodes if n.get("graph") == args["graph"]]
     if args.get("node_prefix"):
         nodes = [n for n in nodes if n["name"].startswith(args["node_prefix"])]
-    out = {"blueprint": parsed["blueprint"], "graphs": parsed["graphs"], "node_count": len(nodes)}
+    out = {"blueprint": parsed["blueprint"], "graphs": parsed["graphs"], "node_count": len(nodes), "deleted_or_generated_nodes_not_counted": parsed["dead_nodes"]}
     calls = {}
     for n in nodes:
         for key in ("function", "event", "variable", "macro"):
@@ -1126,10 +1612,13 @@ def t_inspect_blueprint(args):
                 calls.setdefault(key, set()).add((r.get("parent") or "self") + "." + r["name"])
     out["references"] = {k: sorted(v) for k, v in calls.items()}
     out["problems"] = [{"node": n["name"], "error": n.get("error"), "orphaned_pins": n.get("orphaned_pins")} for n in nodes if n.get("error") or n.get("orphaned_pins")]
+    out["warnings"] = [{"node": n["name"], "warning": n["warning"]} for n in nodes if n.get("warning")]
     if args.get("include_nodes", True):
         slim = []
         for n in nodes[: int(args.get("limit") or 400)]:
             e = {"name": n["name"], "class": n["class"], "graph": n.get("graph")}
+            if "live" in n:
+                e["live"] = n["live"]
             for key in ("function", "event", "variable", "macro", "customFunctionName", "inputKey", "structType"):
                 if n.get(key):
                     e[key] = n[key]
@@ -1138,6 +1627,14 @@ def t_inspect_blueprint(args):
             slim.append(e)
         out["nodes"] = slim
     return json.dumps(out, indent=2)
+
+
+def class_chains(classes):
+    """{class path: parents, nearest first}. Classes the editor can't load are left out."""
+    if not classes:
+        return {}
+    chains = run_json(PY_CLASS_CHAINS, {"classes": classes}, timeout=180)
+    return {k: v for k, v in chains.items() if v is not None}
 
 
 def t_blueprint_filter_check(args):
@@ -1149,9 +1646,11 @@ def t_blueprint_filter_check(args):
     if not paths:
         return "Pass asset_paths (mod Blueprints) or mod_root.", True
     report = {"filter": meta, "checked": [], "blocked": [], "unlisted": []}
+    chains = {}
     for p in paths:
-        parsed = bpscan.parse_t3d(_export_mod_t3d(p))
-        res = bpscan.check_nodes(parsed["nodes"], rules)
+        parsed = bpscan.parse_t3d(export_mod_t3d(p))
+        chains.update(class_chains([c for c in bpscan.classes_used(parsed["nodes"]) if c not in chains]))
+        res = bpscan.check_nodes(parsed["nodes"], rules, chains)
         report["checked"].append({"asset": p, "nodes": len(parsed["nodes"]), "blocked": len(res["blocked"])})
         for b in res["blocked"]:
             b["asset"] = p
@@ -1160,9 +1659,9 @@ def t_blueprint_filter_check(args):
             u["asset"] = p
             report["unlisted"].append(u)
     report["verdict"] = "BLOCKED REFERENCES" if report["blocked"] else "OK"
-    report["note"] = ("Same rule file the upload Asset Audit uses, applied to function/variable/object references found in the "
-                      "T3D export. Parent-class override signatures and the cloud cook's editor-only checks are not covered; "
-                      "run check_upload too.")
+    report["note"] = ("Same rule file the upload Asset Audit uses, applied through class inheritance to the function/variable/object "
+                      "references of live nodes. The editor's own audit decides; parent-class override signatures and the cloud "
+                      "cook's editor-only checks are not covered, so run check_upload too.")
     return json.dumps(report, indent=2), bool(report["blocked"])
 
 
@@ -1187,7 +1686,7 @@ def t_pie_info(args):
 
 
 def t_delete_asset(args):
-    return _json(run_json(PY_DELETE_ASSET, args, timeout=60))
+    return _json(run_json(PY_DELETE_ASSET, args, timeout=60, remote_only=True))
 
 
 def t_close_window(args):
@@ -1198,18 +1697,16 @@ def t_close_window(args):
 
 
 def t_read_editor_log(args):
-    name = args.get("file") or "AbioticFactor.log"
-    path = SAVED_DIR / "Logs" / name
+    path = log_file(args.get("file"))
     if not path.is_file():
         logs = sorted(p.name for p in (SAVED_DIR / "Logs").glob("*.log"))
         return f"No log at {path}. Available: {logs}", True
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        lines = f.read().splitlines()
-    if args.get("contains"):
-        rx = re.compile(args["contains"], re.I)
-        lines = [l for l in lines if rx.search(l)]
+    rx = re.compile(args["contains"], re.I) if args.get("contains") else None
+    since = time.time() - float(args["since_minutes"]) * 60 if args.get("since_minutes") else None
     n = int(args.get("lines", 100))
-    return f"{path} ({len(lines)} matching lines, showing last {min(n, len(lines))})\n" + "\n".join(lines[-n:])
+    lines, whole = tail_log(path, n, rx, since, int(float(args.get("max_scan_mb", 64)) * (1 << 20)))
+    note = "" if whole else " (stopped searching at max_scan_mb; older lines not read)"
+    return f"{path}: last {len(lines)} matching lines{note}\n" + "\n".join(lines)
 
 
 S = lambda **p: p  # noqa: E731
@@ -1259,16 +1756,17 @@ TOOLS = [
      "Save the given assets, or every dirty package when asset_paths is empty.",
      S(asset_paths={"type": "array", "items": STR}), []),
     ("compile_blueprint", t_compile_blueprint,
-     "Compile a Blueprint (saves by default).", S(asset_path=STR, save=BOOL), ["asset_path"]),
+     "Compile a Blueprint and report the compiler's errors and warnings (ok, errors, warnings). Saves by default, "
+     "but not when there are errors unless save_on_error.", S(asset_path=STR, save=BOOL, save_on_error=BOOL), ["asset_path"]),
     ("validate_assets", t_validate_assets,
      "Run Unreal's asset validators on assets or folders. Passing this does NOT mean the upload Asset Audit passes.",
      S(paths={"type": "array", "items": STR}), ["paths"]),
     ("export_t3d", t_export_t3d,
-     "Export a MOD asset (Blueprint/widget) to T3D and report nodes with compile errors or orphaned pins (filter by node_prefix). "
-     "Refuses /Game assets (that crashed the editor).",
+     "Export a MOD asset (Blueprint/widget) to T3D and report live nodes with compile errors or orphaned pins (filter by node_prefix). "
+     "The file also holds deleted nodes and graphs the compiler generates; the report ignores them. Refuses /Game assets (that crashed the editor).",
      S(asset_path=STR, out_file=STR, node_prefix=STR), ["asset_path"]),
     ("t3d_errors", t_t3d_errors,
-     "Report nodes with ErrorMsg / orphaned pins in T3D text or a .t3d file. Deleted nodes linger in exports (undo buffer): use a fresh node-name prefix per paste.",
+     "Report live nodes with ErrorMsg / orphaned pins in T3D text or a .t3d file.",
      S(file=STR, text=STR, node_prefix=STR), []),
     ("check_upload", t_check_upload,
      "Offline pre-upload check of a mod project folder (Upload zips the WHOLE folder): .md files (mod.io error 29200), dev files that would ship, "
@@ -1287,10 +1785,37 @@ TOOLS = [
      "type text, and/or press Enter. Keys only go to the editor when it is in front. In PIE hold keys 300 ms+ (hold_ms).",
      dict(XY, window=WIN, keys={"type": "array", "items": STR}, text=STR, press_enter=BOOL, hold_ms=INT), []),
     ("paste_graph", t_paste_graph,
-     "Paste Blueprint clipboard text (T3D nodes) into the graph shown in a window, in one step: click the graph at x/y "
-     "(default window 600,640), optionally Ctrl+A + Delete first (clear), then Ctrl+V. Paste in passes so custom events exist "
-     "and are compiled before callers; calls to missing functions are dropped silently.",
-     dict(XY, window=WIN, text=STR, file=STR, clear=BOOL, settle_seconds=NUM), []),
+     "Paste Blueprint clipboard text (T3D nodes) into the graph showing in a Blueprint's window, then read the Blueprint back and "
+     "report any nodes or links that didn't arrive, and which graph they landed in. Give asset_path: it opens the Blueprint and enables the "
+     "check, and brings the Event Graph forward if nothing arrives (for another graph, open its tab first). Lints first (duplicate pins, broken links) "
+     "and adds a comment node at the end, because the editor drops the links of the last pasted node. clear = delete what's in the showing graph first "
+     "(needs asset_path). compile = compile if the paste is clean. Paste in passes so custom events exist and are compiled before callers; calls to "
+     "missing functions are dropped. Prefer build_graph for new logic.",
+     dict(XY, window=WIN, asset_path=STR, text=STR, file=STR, clear=BOOL, settle_seconds=NUM, end_comment=BOOL, compile=BOOL, save=BOOL), []),
+    ("open_asset", t_open_asset,
+     "Open an asset's editor window (Blueprint, widget, material...) and return its window title for the other window tools. "
+     "show_graph brings a Blueprint's Event Graph or a widget's Graph view forward; new ones open on the Viewport or Designer.",
+     S(asset_path=STR, show_graph=BOOL, wait_seconds=NUM), ["asset_path"]),
+    ("close_asset", t_close_asset,
+     "Close every editor window open on an asset. Doesn't save.", S(asset_path=STR), ["asset_path"]),
+    ("discover_pins", t_discover_pins,
+     "The real pins of Blueprint nodes (name, direction, type, class, default), read from the editor: nodes are pasted into a throwaway "
+     "Blueprint that is never saved and is deleted afterwards. Nodes use build_graph's format, e.g. {owner:'/Script/Engine.KismetSystemLibrary', function:'PrintString'}. "
+     "Give asset_path to resolve that Blueprint's own functions and variables. Takes focus for a few seconds unless every answer is cached.",
+     S(nodes={"type": "array", "items": OBJ}, asset_path=STR, parent_class=STR), ["nodes"]),
+    ("build_graph", t_build_graph,
+     "Build Blueprint nodes from a list, no T3D writing needed. Every pin name is checked against the pins the editor really allocates, "
+     "and a wrong one is an error listing the real names. Returns the file and what the upload filter would block. With paste=true (needs asset_path) "
+     "it also pastes and verifies; compile=true compiles a clean paste. Paste custom events and compile before pasting callers.\n"
+     "nodes: [{id, type, x?, y?, args?: {pin: literal default}, element?: {cat, obj?} for wildcard pins}]. Types and their fields: "
+     "call {owner?, function} (no owner = this Blueprint's own); array_call {function}; call_parent {owner, function}; event {owner, function}; "
+     "custom_event {name, params?: [{name, cat, obj?, array?}], rpc?: server|client|multicast, reliable?}; var_get / var_set {name, owner?}; cast {target}; branch; "
+     "sequence {outputs?}; self; make_array {count, element}; make_struct / break_struct {struct}; foreach {element}; input_action {name, consume?}; "
+     "spawn_actor / add_component {class}; create_delegate {function}; comment {text, width?, height?}; raw {kind, props?, pins?}.\n"
+     "links: [['a.then', 'b.execute'], ['c.ReturnValue', 'd.InString']]. Exec pins are usually execute/then; see discover_pins. "
+     "Links can't reach nodes already in the graph. spec_file: JSON file with nodes and links, for big graphs.",
+     S(nodes={"type": "array", "items": OBJ}, links={"type": "array", "items": {"type": "array", "items": STR}}, spec_file=STR, asset_path=STR,
+       parent_class=STR, prefix=STR, out_file=STR, paste=BOOL, clear=BOOL, compile=BOOL, save=BOOL), []),
     ("play_in_editor", t_play_in_editor,
      "Start (Alt+P in the main window) or stop Play In Editor. Load a real map first (e.g. /Game/Maps/Facility); close the Message Log first.",
      S(action={"type": "string", "enum": ["start", "stop"]}, wait_seconds=NUM), []),
@@ -1311,11 +1836,12 @@ TOOLS = [
      S(asset_path=STR), ["asset_path"]),
     ("inspect_blueprint", t_inspect_blueprint,
      "Structure of a MOD Blueprint from its T3D export: parent class, variables, graphs with node counts, every function/event/variable "
-     "reference, nodes with compile errors or orphaned pins, and (by default) the node list. Filter by graph or node_prefix.",
-     S(asset_path=STR, graph=STR, node_prefix=STR, include_nodes=BOOL, include_pins=BOOL, limit=INT), ["asset_path"]),
+     "reference, nodes with compile errors or orphaned pins, and (by default) the node list. Only live nodes unless include_deleted. Filter by graph or node_prefix.",
+     S(asset_path=STR, graph=STR, node_prefix=STR, include_nodes=BOOL, include_pins=BOOL, include_deleted=BOOL, limit=INT), ["asset_path"]),
     ("blueprint_filter_check", t_blueprint_filter_check,
      "Check mod Blueprints against Deep Field's Blueprint filter (the list the upload Asset Audit enforces; cached in data/, refreshed daily): "
-     "lists every Blocked function/variable/class reference with its node and the rule that blocks it. Pass asset_paths or mod_root.",
+     "lists every Blocked function/variable/class reference with its node and the rule that blocks it. Rules apply through class "
+     "inheritance, as the filter is written. Pass asset_paths or mod_root.",
      S(asset_paths={"type": "array", "items": STR}, mod_root=STR), []),
     ("load_map", t_load_map,
      "Load a map in the editor, e.g. /Game/Maps/Facility (needed before Play In Editor; a fresh mod opens on Empty).",
@@ -1330,8 +1856,8 @@ TOOLS = [
      "Close one editor window by title (Message Log, a dialog, an asset editor, the PIE window). Refuses the main editor window.",
      S(window=STR), ["window"]),
     ("read_editor_log", t_read_editor_log,
-     "Tail of the Mod Editor log, optional regex filter (works with the editor closed). Upload/mod.io errors are under LogModio.",
-     S(lines=INT, contains={"type": "string", "description": "Case-insensitive regex."}, file=STR), []),
+     "Newest lines of the Mod Editor log, optional regex filter and time limit (works with the editor closed). Upload/mod.io errors are under LogModio.",
+     S(lines=INT, contains={"type": "string", "description": "Case-insensitive regex."}, since_minutes=NUM, max_scan_mb=NUM, file=STR), []),
 ]
 TOOL_MAP = {t[0]: t for t in TOOLS}
 
@@ -1339,7 +1865,8 @@ INSTRUCTIONS = (
     "Tools for the official Abiotic Factor Mod Editor (custom Unreal 5.4.4 cooked editor, Python 3.11). Start with editor_status. "
     "Mods are plugins with an AbioticModConfig and per-row assets (e.g. /<Mod>/DataTables/ItemTable_Gear/<Row>) whose data is the 'row' property. "
     "Never edit or save /Game (base content); never T3D-export /Game Blueprints (crash); never delete many assets in one loop (crash). "
-    "Python cannot create Blueprint nodes: generate T3D and use paste_graph, then compile and export_t3d to check. "
+    "Python cannot create Blueprint nodes: use build_graph (it checks every pin against the editor), which pastes and verifies; "
+    "paste_graph takes T3D you already have. compile_blueprint reports compiler errors. "
     "Copied game Blueprints must pass the upload Asset Audit (Blueprint filter) and the cloud cook; run check_upload before an upload. "
     "Screenshots are per editor window only. The user does mod.io uploads."
 )
