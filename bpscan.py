@@ -1,78 +1,55 @@
-"""Offline Blueprint helpers: parse T3D exports and check references against the
-Blueprint filter the upload Asset Audit and the mod.io cloud cook enforce.
+"""Offline Blueprint helpers: parse T3D exports, and check their references against what the editor's
+Blueprint filter blocks.
 
-Filter format (cdn.abfmods.com/blueprint-filter/1.5/BlueprintFilter.txt):
-    Allow|Block /Script/Module
-    Allow|Block /Script/Module.Class          (or /Game/Path/Asset.Asset_C)
-    Allow|Block /Script/Module.Class Member   (function or variable)
-Rules inherit down the class tree (see resolve). Modules not listed at all are reported as "unlisted".
+The rules come from the editor itself. Its console command ABF.BlueprintFilter.DumpClass <class> prints, per class:
+
+    # /Script/Engine.PlayerController: 68 functions, 26 variables, 0 event dispatchers, 1 blocked by <rules file>
+    /Script/Engine.PlayerController GetHUD
+    ...
+    # Blocked by the current rules
+    # /Script/Engine.PlayerController SetMouseLocation
+
+so class inheritance and rule order are the editor's own, and they're the rules its Asset Audit uses.
 """
 import re
-import time
-import urllib.request
-from pathlib import Path
-
-FILTER_URL = "https://cdn.abfmods.com/blueprint-filter/1.5/BlueprintFilter.txt"
-HERE = Path(__file__).resolve().parent
-FILTER_FILE = HERE / "data" / "BlueprintFilter.txt"
-OBJECT = "/Script/CoreUObject.Object"
 
 
-# ---- filter -----------------------------------------------------------------
+# ---- filter ---------------------------------------------------------------------
 
-def load_filter(max_age_hours=24):
-    """Return (rules, meta). Downloads a fresh copy when the cached one is older than max_age_hours."""
-    meta = {"source": str(FILTER_FILE)}
-    stale = not FILTER_FILE.is_file() or time.time() - FILTER_FILE.stat().st_mtime > max_age_hours * 3600
-    if stale:
-        try:
-            with urllib.request.urlopen(FILTER_URL, timeout=15) as r:
-                data = r.read()
-            if data.startswith(b"# ABF-BlueprintFilter"):
-                FILTER_FILE.parent.mkdir(exist_ok=True)
-                FILTER_FILE.write_bytes(data)
-                meta["downloaded"] = True
-        except Exception as e:                       # offline: fall back to the cached copy
-            meta["download_error"] = str(e)
-    if not FILTER_FILE.is_file():
-        raise RuntimeError("No Blueprint filter available (download failed and no cached copy).")
-    rules = {}
-    for line in FILTER_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
-        if line.startswith("# ContentVersion"):
-            meta["content_version"] = line.split()[-1]
-        parts = line.split(None, 2)
-        if len(parts) >= 2 and parts[0] in ("Allow", "Block"):
-            key = parts[1] + (" " + parts[2].strip() if len(parts) > 2 else "")
-            rules[key] = parts[0]
-    meta["rule_count"] = len(rules)
-    return rules, meta
+_DUMP_HEAD = re.compile(r"^# (/\S+): \d+ functions, \d+ variables, \d+ event dispatchers, \d+ blocked by (.+)$")
+_DUMP_BLOCKED_TITLE = "# Blocked by the current rules"
+_DUMP_MISSING = re.compile(r"DumpClass: no class found for '([^']+)'")
 
 
-def resolve(rules, parent, member=None, ancestors=()):
-    """(verdict, matched_rule) for a reference to `member` on class/asset path `parent`.
-
-    The filter is written for inheritance: it blocks /Script/Engine, allows all of Actor and ActorComponent,
-    and lists exceptions by name (Allow GameCommandSubsystem exists because Block Subsystem would catch it).
-    So the class and its ancestors are tried first, nearest first, member rule before class rule; then their
-    modules, nearest first. Object is left out of the first pass: everything derives from it, so its Block
-    would otherwise beat every module Allow. `ancestors` is the class's parents, nearest first, from the editor;
-    without them only the class's own rules and module apply.
-    """
-    chain = [parent] + [a for a in ancestors if a != parent]
-    for cls in chain:
-        if cls == OBJECT and cls != parent:
+def parse_filter_dumps(lines):
+    """{class: {'blocked': set, 'listed': set, 'rules': file}} from the log lines DumpClass wrote.
+    A class it couldn't find has the value None."""
+    dumps, current, in_blocked = {}, None, False
+    for line in lines:
+        missing = _DUMP_MISSING.search(line)
+        if missing:
+            dumps[missing.group(1)] = None
+            current = None
             continue
-        if member and f"{cls} {member}" in rules:
-            return rules[f"{cls} {member}"], f"{cls} {member}"
-        if cls in rules:
-            return rules[cls], cls
-    for cls in chain:
-        module = cls.split(".")[0]
-        if module in rules:
-            return rules[module], module
-    if parent.startswith("/Game/") or parent.startswith("/Engine/"):
-        return "Allow", None                          # no parents known: the filter lists only exceptions for content
-    return "Unlisted", None
+        head = _DUMP_HEAD.match(line)
+        if head:
+            current = dumps.setdefault(head.group(1), {"blocked": set(), "listed": set(), "rules": head.group(2)})
+            current["path"] = head.group(1)
+            in_blocked = False
+            continue
+        if current is None:
+            continue
+        if line.startswith(_DUMP_BLOCKED_TITLE):
+            in_blocked = True
+            continue
+        path = current["path"]
+        if line.startswith(f"# {path} ") and in_blocked:
+            current["blocked"].add(line[len(path) + 3:].strip())
+        elif line.startswith(f"{path} "):
+            current["listed"].add(line[len(path) + 1:].strip())
+        elif line.startswith("["):       # the next ordinary log line: this dump is over
+            current = None
+    return dumps
 
 
 # ---- T3D parsing ------------------------------------------------------------
@@ -238,49 +215,32 @@ def links_of(nodes):
     return out
 
 
+def member_refs(node):
+    """(class, member, kind) for what the audit checks on a node: function calls, events, variables and event
+    dispatchers. Cast targets and class pins aren't checked. A self-context reference names no class and is skipped."""
+    refs = []
+    for key in ("function", "event", "variable", "delegate"):
+        r = node.get(key)
+        if r and r.get("parent") and "." in r["parent"]:     # a bound event's parent can be a package, not a class
+            refs.append((r["parent"], r["name"], key))
+    return refs
+
+
 def classes_used(nodes):
-    """Class paths the filter would look at for these nodes: what check_nodes needs ancestors for."""
-    used = set()
-    for n in nodes:
-        for key in ("function", "variable", "delegate"):
-            r = n.get(key)
-            if r and r.get("parent"):
-                used.add(r["parent"])
-        for key in ("targetType", "proxyClass", "proxyFactoryClass"):
-            v = n.get(key)
-            if v:
-                pm = _PATHREF.search(v)
-                used.add(pm.group(1) if pm else v)
-    return sorted(used)
+    """Class paths the filter would look at for these nodes."""
+    return sorted({parent for n in nodes for parent, _, _ in member_refs(n)})
 
 
-def check_nodes(nodes, rules, ancestors=None):
-    """Classify every function/variable/object reference in parsed nodes. Returns dict with blocked/unlisted lists.
-    ancestors: {class path: [parents, nearest first]} from the editor."""
-    ancestors = ancestors or {}
-    blocked, unlisted, seen = [], [], set()
+def check_nodes(nodes, dumps):
+    """Classify the references of parsed nodes against parse_filter_dumps output."""
+    blocked, not_checked, seen = [], [], set()
     for n in nodes:
-        refs = []
-        for key in ("function", "variable", "delegate"):
-            r = n.get(key)
-            if r and r.get("parent"):
-                refs.append((r["parent"], r["name"], key))
-        # Classes the node USES (cast target, spawn/construct class, async proxy), not pin types:
-        # the audit checks calls and variables, and parameter/struct types never trip it.
-        for key in ("targetType", "proxyClass", "proxyFactoryClass"):
-            v = n.get(key)
-            if v:
-                pm = _PATHREF.search(v)
-                refs.append((pm.group(1) if pm else v, None, key))
-        for pin in n.get("pins", []):
-            if pin.get("type") == "class" and pin.get("default", "").startswith("/Script/"):
-                refs.append((pin["default"].split("'")[-2] if "'" in pin["default"] else pin["default"], None, "class pin " + pin["name"]))
-        for parent, member, kind in refs:
-            verdict, rule = resolve(rules, parent, member, ancestors.get(parent, ()))
-            key = (parent, member)
-            if verdict == "Block":
-                blocked.append({"node": n["name"], "graph": n.get("graph"), "kind": kind, "parent": parent, "member": member, "rule": rule})
-            elif verdict == "Unlisted" and key not in seen:
-                seen.add(key)
-                unlisted.append({"parent": parent, "member": member, "first_node": n["name"]})
-    return {"blocked": blocked, "unlisted": unlisted}
+        for parent, member, kind in member_refs(n):
+            dump = dumps.get(parent)
+            if dump is None:
+                if parent not in seen:
+                    seen.add(parent)
+                    not_checked.append(parent)
+            elif member in dump["blocked"]:
+                blocked.append({"node": n["name"], "graph": n.get("graph"), "kind": kind, "parent": parent, "member": member})
+    return {"blocked": blocked, "not_checked": not_checked}

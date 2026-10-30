@@ -11,21 +11,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bpscan        # noqa: E402
 import graphbuild    # noqa: E402
 
-OBJ = bpscan.OBJECT
-RULES = {
-    "/Script/CoreUObject": "Block", "/Script/Engine": "Block", OBJ: "Block",
-    "/Script/Engine.ActorComponent": "Allow", "/Script/Engine.Actor": "Allow",
-    "/Script/AbioticFactor": "Allow", "/Script/UMG": "Allow",
-    "/Script/Engine.Subsystem": "Block", "/Script/Engine.GameStateBase": "Block", "/Script/Engine.GameModeBase": "Block",
-    "/Script/AbioticFactor.KeybindSubsystem": "Allow",
-    "/Script/Engine.PlayerController SetMouseLocation": "Block",
-    "/Script/AbioticFactor.AbioticGameMode": "Block",
-    "/Game/Meta/Mode.Mode_C SpawnItem": "Allow",
-    "/Game/Libs/GoodLib.GoodLib_C": "Allow",
-}
-COMPONENT = ["/Script/Engine.SceneComponent", "/Script/Engine.ActorComponent", OBJ]
-LIBRARY = ["/Script/Engine.BlueprintFunctionLibrary", OBJ]
-GAME_MODE = ["/Script/AbioticFactor.AbioticGameMode", "/Script/Engine.GameModeBase", "/Script/Engine.Info", "/Script/Engine.Actor", OBJ]
+DUMP_LOG = [
+    "[2026.10.30-23.20.14:663][ 19]LogPython: world: <Object>",
+    "[2026.10.30-23.20.14:674][ 19]AbioticFactorEditorCookedLog: Display: ",
+    "# /Script/Engine.AudioComponent: 40 functions, 33 variables, 6 event dispatchers, 0 blocked by ../../Build/BlueprintFilter.txt",
+    "",
+    "# Audio | Components | Audio",
+    "/Script/Engine.AudioComponent FadeIn",
+    "/Script/Engine.AudioComponent FadeOut",
+    "# Variables | Sound",
+    "/Script/Engine.AudioComponent Sound",
+    "[2026.10.30-23.20.14:680][ 19]AbioticFactorEditorCookedLog: Display: ",
+    "# /Script/Engine.PlayerController: 68 functions, 26 variables, 0 event dispatchers, 2 blocked by ../../Build/BlueprintFilter.txt",
+    "",
+    "# Game | Player",
+    "/Script/Engine.PlayerController GetHUD",
+    "# Blocked by the current rules",
+    "# /Script/Engine.PlayerController SetMouseLocation",
+    "# /Script/Engine.PlayerController Some Spaced Name",
+    "[2026.10.30-23.20.14:690][ 19]LogSomething: # /Script/Engine.PlayerController NotInTheDump",
+    "[2026.10.30-23.20.14:690][ 19]AbioticFactorEditorCookedLog: ABF.BlueprintFilter.DumpClass: no class found for '/Game/Gone.Gone_C'.",
+]
 
 
 def pin(pid, name, cat="exec", out=False, links=""):
@@ -100,52 +106,44 @@ def clipboard(last_links=True):
 
 
 class Filter(unittest.TestCase):
-    def verdict(self, *a):
-        return bpscan.resolve(RULES, *a)[0]
+    def setUp(self):
+        self.dumps = bpscan.parse_filter_dumps(DUMP_LOG)
 
-    def test_inherited_allow(self):
-        self.assertEqual(self.verdict("/Script/Engine.AudioComponent", "FadeOut", COMPONENT), "Allow")
-        self.assertEqual(self.verdict("/Script/Engine.Pawn", "IsLocallyControlled", ["/Script/Engine.Actor", OBJ]), "Allow")
+    def test_blocked_section(self):
+        pc = self.dumps["/Script/Engine.PlayerController"]
+        self.assertEqual(pc["blocked"], {"SetMouseLocation", "Some Spaced Name"})
+        self.assertEqual(pc["listed"], {"GetHUD"})
+        self.assertTrue(pc["rules"].endswith("BlueprintFilter.txt"))
 
-    def test_block_nearer_than_allow(self):
-        self.assertEqual(self.verdict("/Script/Engine.GameStateBase", "X", ["/Script/Engine.Info", "/Script/Engine.Actor", OBJ]), "Block")
+    def test_nothing_blocked(self):
+        audio = self.dumps["/Script/Engine.AudioComponent"]
+        self.assertEqual(audio["blocked"], set())
+        self.assertEqual(audio["listed"], {"FadeIn", "FadeOut", "Sound"})
 
-    def test_member_block_under_allowed_class(self):
-        chain = ["/Script/Engine.Controller", "/Script/Engine.Actor", OBJ]
-        self.assertEqual(self.verdict("/Script/Engine.PlayerController", "SetMouseLocation", chain), "Block")
-        self.assertEqual(self.verdict("/Script/Engine.PlayerController", "GetHUD", chain), "Allow")
+    def test_class_not_found(self):
+        self.assertIsNone(self.dumps["/Game/Gone.Gone_C"])
 
-    def test_inherited_member_rule(self):
-        chain = ["/Script/Engine.PlayerController", "/Script/Engine.Controller", "/Script/Engine.Actor", OBJ]
-        self.assertEqual(self.verdict("/Script/AbioticFactor.MyController", "SetMouseLocation", chain), "Block")
+    def nodes(self, *refs):
+        return [{"name": f"N{i}", "graph": "EventGraph", kind: {"parent": parent, "name": member}} for i, (kind, parent, member) in enumerate(refs)]
 
-    def test_module_allow_beats_object_block(self):
-        self.assertEqual(self.verdict("/Script/AbioticFactor.GlobalItemHandleFunctionLibrary", "Conv", LIBRARY), "Allow")
+    def test_check_nodes(self):
+        nodes = self.nodes(("function", "/Script/Engine.PlayerController", "SetMouseLocation"),
+                           ("function", "/Script/Engine.PlayerController", "GetHUD"),
+                           ("function", "/Script/Engine.AudioComponent", "FadeOut"),
+                           ("variable", "/Script/Engine.PlayerController", "Some Spaced Name"),
+                           ("event", "/Game/Gone.Gone_C", "Whatever"))
+        r = bpscan.check_nodes(nodes, self.dumps)
+        self.assertEqual([(b["member"], b["kind"]) for b in r["blocked"]], [("SetMouseLocation", "function"), ("Some Spaced Name", "variable")])
+        self.assertEqual(r["not_checked"], ["/Game/Gone.Gone_C"])
 
-    def test_ancestor_class_rule_beats_own_module(self):
-        chain = ["/Script/Engine.Subsystem", OBJ]
-        self.assertEqual(self.verdict("/Script/AbioticFactor.OtherSubsystem", "X", chain), "Block")
-        self.assertEqual(self.verdict("/Script/AbioticFactor.KeybindSubsystem", "X", chain), "Allow")
+    def test_only_class_references_count(self):
+        node = {"name": "N", "function": {"parent": None, "name": "SelfCall"}, "event": {"parent": "/Script/UMG", "name": "Sig"},
+                "targetType": "x", "pins": []}
+        self.assertEqual(bpscan.member_refs(node), [])
 
-    def test_engine_library_with_no_rule(self):
-        self.assertEqual(self.verdict("/Script/Engine.ImportanceSamplingLibrary", "X", LIBRARY), "Block")
-
-    def test_game_class(self):
-        mode = "/Game/Meta/Mode.Mode_C"
-        self.assertEqual(self.verdict(mode, "SpawnItem", GAME_MODE), "Allow")
-        self.assertEqual(self.verdict(mode, "SomethingElse", GAME_MODE), "Block")
-        self.assertEqual(self.verdict("/Game/Libs/GoodLib.GoodLib_C", "Fn", LIBRARY), "Allow")
-        self.assertEqual(self.verdict("/Game/Libs/OtherLib.OtherLib_C", "Fn", LIBRARY), "Block")
-
-    def test_no_parents_known(self):
-        self.assertEqual(self.verdict("/Game/Unknown.Unknown_C", "Fn"), "Allow")
-        self.assertEqual(self.verdict("/Script/Engine.Unknown", "Fn"), "Block")
-        self.assertEqual(self.verdict("/Script/NotListed.Thing", "Fn"), "Unlisted")
-
-    def test_check_nodes_uses_parents(self):
-        nodes = bpscan.parse_t3d(EXPORT)["nodes"]
-        self.assertEqual(bpscan.check_nodes(nodes, RULES)["blocked"][0]["member"], "FadeOut")
-        self.assertEqual(bpscan.check_nodes(nodes, RULES, {"/Script/Engine.AudioComponent": COMPONENT})["blocked"], [])
+    def test_classes_used(self):
+        nodes = self.nodes(("function", "/Script/B.B", "x"), ("variable", "/Script/A.A", "y"), ("delegate", "/Script/A.A", "z"))
+        self.assertEqual(bpscan.classes_used(nodes), ["/Script/A.A", "/Script/B.B"])
 
 
 class Parsing(unittest.TestCase):
@@ -174,10 +172,6 @@ class Parsing(unittest.TestCase):
 
     def test_links(self):
         self.assertEqual(bpscan.links_of(bpscan.parse_t3d(clipboard())["nodes"]), {("P_0", "then", "P_1", "execute")})
-
-    def test_long_filter_member_name(self):
-        rules, _ = bpscan.load_filter(max_age_hours=10 ** 6)
-        self.assertTrue(any(k.endswith("Find Existing Player Placed") or " Find Existing" in k for k in rules))
 
 
 class PasteChecks(unittest.TestCase):

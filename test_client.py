@@ -1,4 +1,4 @@
-﻿"""End-to-end check: start server.py over stdio, speak MCP to it, call tools.
+"""End-to-end check: start server.py over stdio, speak MCP to it, call tools.
 
     python -I test_client.py                       # read-only checks against the open editor
     python -I test_client.py --bridge              # same, forcing the file-bridge transport

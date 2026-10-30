@@ -64,7 +64,7 @@ The server uses remote execution first and the bridge second, opens a fresh conn
 
 The editor's **Upload Mod** zips the whole project folder and mod.io rejects some of what ends up inside (for instance any `.md` file, reported only as "Unknown ApiError"). The cloud cook then recompiles Blueprints without the editor-only assets, so a reference to something that exists only in the editor fails there. `check_upload` scans the folder for both, using the file lists in `data/` (names only, from game/editor version 1.5; see `data/make_editor_list.py`).
 
-The upload's Asset Audit checks Blueprint calls and variables against a filter list Deep Field publishes. `blueprint_filter_check` downloads that list (cached a day) and applies it to a mod's Blueprints, naming each blocked call and the node it's on — before you find out one upload at a time. The rules apply through class inheritance: the list allows all of `Actor` and `ActorComponent`, so `AudioComponent.FadeOut` is fine, then blocks exceptions by name. This was compared with the editor's real audit: on a test Blueprint with 14 calls, both blocked the same 6 and allowed the same 8, and a real mod got 0 blocked from each. The audit reads the nodes, not the compiled code, so an unconnected blocked call still fails it.
+The upload's Asset Audit checks every function call, event, variable and event dispatcher in a mod's Blueprints against Deep Field's filter rules. `blueprint_filter_check` asks the editor for those same rules, with its `ABF.BlueprintFilter.DumpClass` console command, and names each blocked reference and the node it's on, before you find out one upload at a time. Nothing is downloaded, so the answer always matches the audit in your editor. This was compared with the real audit on test Blueprints and on a real mod, and the results were the same. The audit reads the nodes, not the compiled code, so an unconnected blocked call still fails it.
 
 Neither replaces the editor's own checks; they catch the common failures early.
 
@@ -118,4 +118,4 @@ The result also lists anything the upload filter would block. For nodes `build_g
 
 ## License
 
-MIT. The Blueprint filter list belongs to Deep Field Games and is downloaded from their CDN at run time, not shipped here.
+MIT. Deep Field Games' Blueprint filter rules aren't shipped here: the tools ask the editor you have installed.

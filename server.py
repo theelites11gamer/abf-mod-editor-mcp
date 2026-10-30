@@ -35,7 +35,7 @@ import graphbuild  # noqa: E402
 import paths     # noqa: E402
 
 SERVER_NAME = "abiotic-mod-editor"
-SERVER_VERSION = "2.3.0"
+SERVER_VERSION = "2.3.1"
 
 EDITOR_ROOT = paths.find_editor_root()          # None when no Mod Editor install was found
 EDITOR_EXE = paths.editor_exe(EDITOR_ROOT)
@@ -725,31 +725,13 @@ def _abf(args):
     return {"assets": hits}
 '''
 
-# Parents of a class, nearest first. A Blueprint class's Python type is its nearest native parent, which is all the filter needs.
-PY_CLASS_CHAINS = r'''
+# The editor's filter says what it blocks, per class. It prints to the log.
+PY_FILTER_DUMP = r'''
 def _abf(args):
-    out = {}
+    world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
     for path in args["classes"]:
-        try:
-            cls = unreal.load_class(None, path)
-        except Exception:
-            cls = None
-        if cls is None:
-            out[path] = None
-            continue
-        chain = []
-        for t in unreal.get_type_from_class(cls).__mro__:
-            sc = getattr(t, "static_class", None)
-            if sc is None:
-                continue
-            try:
-                name = sc().get_path_name()
-            except Exception:
-                continue
-            if name != path and name not in chain:
-                chain.append(name)
-        out[path] = chain
-    return out
+        unreal.SystemLibrary.execute_console_command(world, "ABF.BlueprintFilter.DumpClass " + path)
+    return {"asked": len(args["classes"])}
 '''
 
 # A throwaway Blueprint: never saved and outside the mod, so it can't ship. /Temp is refused as an asset path here.
@@ -1523,11 +1505,10 @@ def t_discover_pins(args):
 
 
 def blocked_calls(text):
-    """What the upload filter would block in this clipboard text."""
-    rules, _ = bpscan.load_filter()
+    """What the editor's Blueprint filter would block in this clipboard text."""
     nodes = bpscan.parse_t3d(text)["nodes"]
-    chains = class_chains(bpscan.classes_used(nodes))
-    return [{"class": b["parent"], "member": b["member"], "rule": b["rule"]} for b in bpscan.check_nodes(nodes, rules, chains)["blocked"]]
+    result = bpscan.check_nodes(nodes, filter_dumps(bpscan.classes_used(nodes)))
+    return [{"class": b["parent"], "member": b["member"], "kind": b["kind"]} for b in result["blocked"]]
 
 
 def t_build_graph(args):
@@ -1556,7 +1537,12 @@ def t_build_graph(args):
     out = Path(args.get("out_file") or (HERE / "exports" / "graphs" / f"{prefix}.t3d"))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(built["text"], encoding="utf-8")
-    report.update(file=str(out), node_names=built["names"], blocked_by_upload_filter=blocked_calls(built["text"]))
+    report.update(file=str(out), node_names=built["names"])
+    try:
+        report["blocked_by_upload_filter"] = blocked_calls(built["text"])
+    except RemoteError as e:                 # the graph is still good; only this check is missing
+        report["blocked_by_upload_filter"] = None
+        report["filter_note"] = f"Couldn't ask the editor about the upload filter: {e}"
     if not args.get("paste"):
         report["ok"] = True
         return json.dumps(report, indent=2), False
@@ -1629,39 +1615,51 @@ def t_inspect_blueprint(args):
     return json.dumps(out, indent=2)
 
 
-def class_chains(classes):
-    """{class path: parents, nearest first}. Classes the editor can't load are left out."""
-    if not classes:
-        return {}
-    chains = run_json(PY_CLASS_CHAINS, {"classes": classes}, timeout=180)
-    return {k: v for k, v in chains.items() if v is not None}
+_FILTER_DUMPS = {}
+
+
+def filter_dumps(classes):
+    """{class: what the editor's Blueprint filter says about it}, or None for a class it can't find.
+    Game and engine classes are remembered: the rules only change when the editor restarts."""
+    todo = [c for c in classes if c not in _FILTER_DUMPS]
+    found = {}
+    if todo:
+        mark = log_mark()
+        run_json(PY_FILTER_DUMP, {"classes": todo}, timeout=120)
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            time.sleep(0.4)             # the log file is written a moment later
+            found = bpscan.parse_filter_dumps(log_since(mark))
+            if all(c in found for c in todo):
+                break
+        for c in todo:
+            if c.startswith(("/Script/", "/Game/")) and found.get(c) is not None:
+                _FILTER_DUMPS[c] = found[c]
+    return {c: _FILTER_DUMPS.get(c, found.get(c)) for c in classes}
 
 
 def t_blueprint_filter_check(args):
-    rules, meta = bpscan.load_filter()
     paths = list(args.get("asset_paths") or [])
     if args.get("mod_root"):
         found = run_json(PY_FIND_ASSETS, {"path": args["mod_root"], "limit": 2000}, timeout=120)
         paths += [a["path"] for a in found["assets"] if a["class"] in ("Blueprint", "WidgetBlueprint", "AnimBlueprint")]
     if not paths:
         return "Pass asset_paths (mod Blueprints) or mod_root.", True
-    report = {"filter": meta, "checked": [], "blocked": [], "unlisted": []}
-    chains = {}
+    report = {"rules": None, "checked": [], "blocked": [], "not_checked": []}
     for p in paths:
         parsed = bpscan.parse_t3d(export_mod_t3d(p))
-        chains.update(class_chains([c for c in bpscan.classes_used(parsed["nodes"]) if c not in chains]))
-        res = bpscan.check_nodes(parsed["nodes"], rules, chains)
+        dumps = filter_dumps(bpscan.classes_used(parsed["nodes"]))
+        res = bpscan.check_nodes(parsed["nodes"], dumps)
+        report["rules"] = report["rules"] or next((d["rules"] for d in dumps.values() if d), None)
         report["checked"].append({"asset": p, "nodes": len(parsed["nodes"]), "blocked": len(res["blocked"])})
         for b in res["blocked"]:
             b["asset"] = p
             report["blocked"].append(b)
-        for u in res["unlisted"]:
-            u["asset"] = p
-            report["unlisted"].append(u)
+        report["not_checked"] += [c for c in res["not_checked"] if c not in report["not_checked"]]
     report["verdict"] = "BLOCKED REFERENCES" if report["blocked"] else "OK"
-    report["note"] = ("Same rule file the upload Asset Audit uses, applied through class inheritance to the function/variable/object "
-                      "references of live nodes. The editor's own audit decides; parent-class override signatures and the cloud "
-                      "cook's editor-only checks are not covered, so run check_upload too.")
+    report["note"] = ("The editor's own Blueprint filter rules, applied to the function, event, variable and event dispatcher references of live "
+                      "nodes, as its Asset Audit does. not_checked: classes the editor couldn't find. Parent-class override signatures and the "
+                      "cloud cook's editor-only checks aren't covered, so run check_upload too.")
     return json.dumps(report, indent=2), bool(report["blocked"])
 
 
@@ -1839,9 +1837,8 @@ TOOLS = [
      "reference, nodes with compile errors or orphaned pins, and (by default) the node list. Only live nodes unless include_deleted. Filter by graph or node_prefix.",
      S(asset_path=STR, graph=STR, node_prefix=STR, include_nodes=BOOL, include_pins=BOOL, include_deleted=BOOL, limit=INT), ["asset_path"]),
     ("blueprint_filter_check", t_blueprint_filter_check,
-     "Check mod Blueprints against Deep Field's Blueprint filter (the list the upload Asset Audit enforces; cached in data/, refreshed daily): "
-     "lists every Blocked function/variable/class reference with its node and the rule that blocks it. Rules apply through class "
-     "inheritance, as the filter is written. Pass asset_paths or mod_root.",
+     "Check mod Blueprints against the editor's own Blueprint filter (the rules its upload Asset Audit enforces): lists every blocked "
+     "function call, event, variable and event dispatcher with its node. Pass asset_paths or mod_root.",
      S(asset_paths={"type": "array", "items": STR}, mod_root=STR), []),
     ("load_map", t_load_map,
      "Load a map in the editor, e.g. /Game/Maps/Facility (needed before Play In Editor; a fresh mod opens on Empty).",
