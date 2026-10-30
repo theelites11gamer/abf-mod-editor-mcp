@@ -6,6 +6,8 @@ With it, the assistant can open a mod, read and edit item/recipe/buff rows, crea
 
 Pure Python, no packages, Windows only (the editor is Windows only). Not affiliated with Deep Field Games, Playstack or mod.io.
 
+New to this? There's a step-by-step setup and usage guide on mod.io: [Use an AI assistant with the Mod Editor (MCP setup guide)](https://mod.io/g/abiotic-factor/r/use-an-ai-assistant-with-the-mod-editor-mcp-setup-guide).
+
 ## Requirements
 
 - Windows 10/11
