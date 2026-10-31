@@ -15,6 +15,9 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import bpscan        # noqa: E402
+import graphbuild    # noqa: E402
 
 
 class Client:
@@ -50,6 +53,80 @@ ACTOR = "/Script/Engine.Actor"
 PAWN = "/Script/Engine.Pawn"
 GS = "/Script/Engine.GameplayStatics"
 VECTOR = "/Script/CoreUObject.Vector"
+PANEL = "/Script/UMG.PanelWidget"
+
+
+def pure_chain_text(prefix, second_print=False):
+    """Clipboard text: event > GetAllChildren > PrintString, giving GetAllChildren, a pure function, exec pins.
+    second_print adds another PrintString on its then pin, which the editor can't join: an exec output holds one link."""
+    ids = {k: graphbuild.new_id() for k in ("event", "in", "then", "self", "print", "print2", "parent")}
+
+    def pin(pid, name, cat="exec", out=False, links=(), obj=None):
+        direction = 'Direction="EGPD_Output",' if out else ""
+        sub = f"PinType.PinSubCategoryObject=\"/Script/CoreUObject.Class'{obj}'\"," if obj else ""
+        linked = "LinkedTo=(" + "".join(f"{prefix}_{n} {ids[p]}," for n, p in links) + ")," if links else ""
+        return f'CustomProperties Pin (PinId={ids[pid]},PinName="{name}",{direction}PinType.PinCategory="{cat}",{sub}{linked})'
+
+    def call(n, owner, function, *pins):
+        return [f'Begin Object Class=/Script/BlueprintGraph.K2Node_CallFunction Name="{prefix}_{n}"',
+                f'FunctionReference=(MemberParent="/Script/CoreUObject.Class\'{owner}\'",MemberName="{function}")',
+                f"NodePosX={n * 400}", "NodePosY=0", *pins, "End Object"]
+
+    onward = [(2, "print")] + ([(4, "print2")] if second_print else [])
+    lines = [f'Begin Object Class=/Script/BlueprintGraph.K2Node_CustomEvent Name="{prefix}_0"', f'CustomFunctionName="{prefix}Event"',
+             "NodePosX=0", "NodePosY=0", pin("event", "then", out=True, links=[(1, "in")]), "End Object"]
+    lines += call(1, PANEL, "GetAllChildren", pin("in", "execute", links=[(0, "event")]), pin("then", "then", out=True, links=onward),
+                  pin("self", "self", "object", links=[(3, "parent")], obj=PANEL))
+    lines += call(2, KSL, "PrintString", pin("print", "execute", links=[(1, "then")]))
+    lines += call(3, "/Script/UMG.Widget", "GetParent", pin("parent", "ReturnValue", "object", out=True, links=[(1, "self")], obj=PANEL))
+    if second_print:
+        lines += call(4, KSL, "PrintString", pin("print2", "execute", links=[(1, "then")]))
+    return "\n".join(lines) + "\n"
+
+
+def pure_and_text_checks(check, need, widget):
+    """On a widget Blueprint whose graph may be cleared. Nothing here saves it."""
+    # The editor takes a pure node's exec pins off and joins the chain around it. That's the right graph, not a failure.
+    _, text = check("paste_graph", asset_path=widget, text=pure_chain_text("McpPure"), clear=True, compile=True, save=False)
+    report = json.loads(text)
+    need("pure node: the paste counts as fine", report.get("ok") is True and not report.get("missing_links"), report)
+    need("pure node: reported as a warning", report.get("pure_nodes") == ["McpPure_1"] and any("pure node" in w for w in report.get("lint_warnings", [])), report)
+    need("pure node: chain joined around it", report.get("joined_links") == [{"from": "McpPure_0.then", "to": "McpPure_2.execute"}], report)
+    need("pure node: compile ran, clean", report.get("compile", {}).get("ok") is True, report.get("compile"))
+
+    # A chain the editor can't join is still a failure, and isn't compiled.
+    _, text = check("paste_graph", expect_error=True, asset_path=widget, text=pure_chain_text("McpCut", second_print=True), clear=True, compile=True, save=False)
+    report = json.loads(text)
+    need("pure node: a cut chain still fails", report.get("ok") is False and report.get("missing_links") == [{"from": "McpCut_0.then", "to": "McpCut_4.execute"}], report)
+    need("pure node: no compile after a failure", "compile" not in report, report)
+
+    # Any character outside ASCII makes the editor write the export as UTF-16, and everything reading it has to keep working.
+    label = "15\xb0 \xb7 caf\xe9"
+    say = {"id": "say", "owner": KSL, "function": "PrintString", "args": {"InString": label}}
+    _, text = check("build_graph", contains='"nodes_found"', asset_path=widget, paste=True, clear=True, compile=True, save=False,
+                    nodes=[{"id": "e", "type": "custom_event", "name": "McpNotAscii"}, say], links=[["e.then", "say.execute"]])
+    report = json.loads(text)
+    need("not ASCII: paste read back", report.get("ok") is True and report.get("paste", {}).get("nodes_found") == 3, report)
+    need("not ASCII: compiled", report.get("paste", {}).get("compile", {}).get("ok") is True, report.get("paste"))
+    # Now every read-back is of a UTF-16 file. A read that finds nothing would paste a second time.
+    _, text = check("build_graph", contains='"nodes_found"', asset_path=widget, paste=True, save=False,
+                    nodes=[{"id": "e", "type": "custom_event", "name": "McpNotAscii2"}, say], links=[["e.then", "say.execute"]])
+    report = json.loads(text)
+    need("not ASCII: second paste read back", report.get("ok") is True and report.get("paste", {}).get("nodes_found") == 3, report)
+    need("not ASCII: pasted once", "brought_graph_forward" not in report.get("paste", {}), report.get("paste"))
+    _, text = check("export_t3d", contains='"nodes_checked"', asset_path=widget)
+    export = json.loads(text)
+    raw = Path(export["file"]).read_bytes()
+    need("not ASCII: the export is UTF-16", raw[:2] == b"\xff\xfe", raw[:8])
+    need("not ASCII: export_t3d found the nodes", export["nodes_checked"] == 6, export)
+    need("not ASCII: bytes is the file's size", export["bytes"] == len(raw), export)
+    need("not ASCII: the text is intact", label in bpscan.read_t3d(export["file"]))
+    _, text = check("t3d_errors", contains='"nodes_checked"', file=export["file"])
+    need("not ASCII: t3d_errors reads the file", json.loads(text)["nodes_checked"] == 6, text[:300])
+    _, text = check("inspect_blueprint", contains="WidgetBlueprint", asset_path=widget, include_nodes=False)
+    need("not ASCII: inspect_blueprint found the nodes", json.loads(text)["node_count"] == 6, text[:300])
+    _, text = check("blueprint_filter_check", contains='"verdict"', expect_error=None, asset_paths=[widget])
+    need("not ASCII: the filter check found the nodes", json.loads(text)["checked"][0]["nodes"] == 6, text[:300])
 
 
 def graph_checks(check, mod_root, failures):
@@ -130,7 +207,7 @@ def graph_checks(check, mod_root, failures):
 
         # The defaults reached the real pins, and the default events are gone.
         _, text = check("export_t3d", contains='"deleted_or_generated_nodes_ignored"', asset_path=bp)
-        export = Path(json.loads(text)["file"]).read_text(encoding="utf-8", errors="replace")
+        export = bpscan.read_t3d(json.loads(text)["file"])
         need("export reports no problems", json.loads(text)["problems"] == [], json.loads(text)["problems"])
         need("string default kept", 'DefaultValue="Hello from build_graph"' in export)
         need("number default kept", 'DefaultValue="2.5' in export)
@@ -203,6 +280,7 @@ def graph_checks(check, mod_root, failures):
                         links=[["go.then", "vis.execute"], ["self.self", "vis.self"]])
         report = json.loads(text)
         need("widget graph built", report.get("ok") is True, report.get("paste"))
+        pure_and_text_checks(check, need, widget)
         check("open_asset", contains="BP_McpGraphTest", asset_path=bp, show_graph=True)
         check("editor_screenshot", window="BP_McpGraphTest", max_width=1600, save_as="graph_test.png")
     finally:

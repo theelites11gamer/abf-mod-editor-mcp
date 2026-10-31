@@ -11,7 +11,9 @@ The rules come from the editor itself. Its console command ABF.BlueprintFilter.D
 
 so class inheritance and rule order are the editor's own, and they're the rules its Asset Audit uses.
 """
+import codecs
 import re
+from pathlib import Path
 
 
 # ---- filter ---------------------------------------------------------------------
@@ -66,6 +68,15 @@ _PATHREF = re.compile(r"""(?:Class|BlueprintGeneratedClass|WidgetBlueprintGenera
 _GRAPH_NODE = re.compile(r"""^\s*Nodes\(\d+\)="?[^'"\n]*'([^'"\n]+)'""", re.M)
 _REAL_GRAPH = re.compile(r"""^\s*(?:UbergraphPages|FunctionGraphs|MacroGraphs|DelegateSignatureGraphs)\(\d+\)="?[^'"\n]*'([^'"\n]+)'""", re.M)
 _INTERFACE_LINE = re.compile(r"^\s*ImplementedInterfaces\(\d+\)=(.*)$", re.M)
+_NEWLINE = re.compile(r"\r\n?|\n")
+
+
+def read_t3d(path, errors="replace"):
+    """Text of a T3D file. The editor writes plain ASCII until an asset holds any other character, and then the whole
+    file is UTF-16 with a byte-order mark. Read as UTF-8 that parses as an empty Blueprint, with no error."""
+    raw = Path(path).read_bytes()
+    encoding = "utf-16" if raw[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE) else "utf-8-sig"
+    return _NEWLINE.sub("\n", raw.decode(encoding, errors))
 
 
 def _member_ref(body, kind):
@@ -137,7 +148,8 @@ def parse_t3d(text, include_dead=False, keep_body=False):
     order = []
     stack = []            # keys of enclosing objects
     bp = {}
-    for line in text.splitlines():
+    # Not splitlines(): a line separator or similar character inside a text default would cut its pin's line in two.
+    for line in _NEWLINE.split(text):
         m = _BEGIN.match(line)
         if m:
             cls, name = (m.group(2) or ""), m.group(3)
@@ -202,6 +214,11 @@ def parse_t3d(text, include_dead=False, keep_body=False):
     return {"blueprint": bp, "graphs": graphs, "nodes": nodes, "dead_nodes": dead}
 
 
+def link_key(a, b):
+    """The (node, pin, node, pin) that stands for a link between two (node, pin) ends, whichever way round they come."""
+    return (a + b) if a <= b else (b + a)
+
+
 def links_of(nodes):
     """Every link between the given parsed nodes as (node, pin, node, pin), each pair once."""
     pin_names = {(n["name"], p["id"]): p["name"] for n in nodes for p in n["pins"] if p.get("id")}
@@ -209,9 +226,7 @@ def links_of(nodes):
     for n in nodes:
         for p in n["pins"]:
             for target, target_id in p.get("linked_ids", ()):
-                a = (n["name"], p["name"])
-                b = (target, pin_names.get((target, target_id), "?" + target_id))
-                out.add((a + b) if a <= b else (b + a))
+                out.add(link_key((n["name"], p["name"]), (target, pin_names.get((target, target_id), "?" + target_id))))
     return out
 
 

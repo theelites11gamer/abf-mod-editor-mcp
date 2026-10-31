@@ -462,6 +462,33 @@ def ensure_end_comment(text):
     return text.rstrip("\n") + "\n" + comment_block(sum(xs) // len(xs), sum(ys) // len(ys)), True
 
 
+def _join_around_pure(sent, found):
+    """A pure function has no exec pins. When a paste links some on it, the editor takes them off and joins what led into
+    the node to what came after it, so the chain still runs and the graph is right.
+
+    Returns (those nodes, their exec links as sent, the links that should stand in their place), the links as link_key
+    writes them. A node that kept an exec pin, even an orphaned one, isn't one of them: its links are still expected."""
+    exec_pins = {(n["name"], p["id"]): p for n in sent for p in n["pins"] if p["type"] == "exec"}
+    sent_exec = set()       # ((out node, pin), (in node, pin))
+    for (name, _), p in exec_pins.items():
+        for target in p.get("linked_ids", ()):
+            if target in exec_pins:
+                here, there = (name, p["name"]), (target[0], exec_pins[target]["name"])
+                sent_exec.add((here, there) if p["dir"] == "out" else (there, here))
+    linked = {end[0] for link in sent_exec for end in link}
+    pure = sorted(n for n in linked if n in found and not any(p["type"] == "exec" for p in found[n]["pins"]))
+    remaining = set(sent_exec)
+    for name in pure:
+        into = {e for e in remaining if e[1][0] == name}
+        onward = {e for e in remaining if e[0][0] == name}
+        remaining = (remaining - into - onward) | {(i[0], o[1]) for i in into for o in onward if i[0][0] != name and o[1][0] != name}
+    return pure, {bpscan.link_key(*e) for e in sent_exec - remaining}, {bpscan.link_key(*e) for e in remaining - sent_exec}
+
+
+def _link_report(links, found):
+    return [{"from": f"{a}.{ap}", "to": f"{b}.{bp}"} for a, ap, b, bp in sorted(links) if a in found and b in found]
+
+
 def verify(sent_text, export_text):
     """Compare what was pasted with what the Blueprint now holds. Only makes sense when the node names are new."""
     sent = bpscan.parse_t3d(sent_text)["nodes"]
@@ -480,11 +507,12 @@ def verify(sent_text, export_text):
             changed.append({"node": n["name"], "sent": n["class"].split(".")[-1], "now": got["class"]})
     sent_links = bpscan.links_of(sent)
     kept = bpscan.links_of([found[n] for n in names if n in found])
-    missing_links = [{"from": f"{a}.{ap}", "to": f"{b}.{bp}"} for a, ap, b, bp in sorted(sent_links - kept)
-                     if a in found and b in found]
+    pure, replaced, joined = _join_around_pure(sent, found)
+    missing_links = _link_report(((sent_links - replaced) | joined) - kept, found)
     problems = [{"node": n, "error": found[n].get("error"), "orphaned_pins": found[n].get("orphaned_pins")}
                 for n in names if n in found and (found[n].get("error") or found[n].get("orphaned_pins"))]
     return {"nodes_sent": len(names), "nodes_found": len(names) - len(missing_nodes), "missing_nodes": missing_nodes,
             "links_sent": len(sent_links), "missing_links": missing_links, "changed_class": changed,
+            "pure_nodes": pure, "joined_links": _link_report(joined & kept, found),
             "problems": problems, "landed_in": landed,
             "ok": not (missing_nodes or missing_links or changed)}

@@ -3,7 +3,9 @@
     python -I test_offline.py
 """
 
+import codecs
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -173,6 +175,51 @@ class Parsing(unittest.TestCase):
     def test_links(self):
         self.assertEqual(bpscan.links_of(bpscan.parse_t3d(clipboard())["nodes"]), {("P_0", "then", "P_1", "execute")})
 
+    def test_line_separator_in_text_keeps_the_pin(self):
+        for char in ("\u2028", "\u2029", "\x85", "\x0b", "\x0c", "\x1c"):
+            line = pin("CC", "InString", "string").replace('PinType.PinSubCategory=""', f'DefaultValue="a{char}b",PinType.PinSubCategory=""')
+            text = clipboard().replace("End Object\n", line + "\nEnd Object\n", 1)
+            node = bpscan.parse_t3d(text)["nodes"][0]
+            self.assertEqual([p["name"] for p in node["pins"]], ["then", "InString"], repr(char))
+            self.assertEqual(node["pins"][1]["default"], f"a{char}b")
+
+
+class ReadingFiles(unittest.TestCase):
+    TEXT = EXPORT.replace('ErrorMsg="Something is wrong"', 'ErrorMsg="Rotate 15\u00b0 \u00b7 Scale x2"')
+
+    def read(self, raw, **kwargs):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "x.t3d"
+            path.write_bytes(raw)
+            return bpscan.read_t3d(path, **kwargs)
+
+    def test_utf16_with_bom_parses(self):
+        for bom, codec in ((codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF16_BE, "utf-16-be")):
+            text = self.read(bom + self.TEXT.encode(codec))
+            self.assertEqual(text, self.TEXT)
+            self.assertEqual([n["error"] for n in bpscan.parse_t3d(text)["nodes"] if n.get("error")], ["Rotate 15\u00b0 \u00b7 Scale x2"])
+
+    def test_plain_ascii_and_utf8(self):
+        self.assertEqual(self.read(EXPORT.encode("ascii")), EXPORT)
+        self.assertEqual(self.read(self.TEXT.encode("utf-8")), self.TEXT)
+        self.assertEqual(self.read(codecs.BOM_UTF8 + self.TEXT.encode("utf-8")), self.TEXT)
+
+    def test_newlines_match_a_text_mode_read(self):
+        windows = self.TEXT.replace("\n", "\r\n")
+        self.assertEqual(self.read(codecs.BOM_UTF16_LE + windows.encode("utf-16-le")), self.TEXT)
+        self.assertEqual(self.read(windows.encode("utf-8")), self.TEXT)
+
+    def test_characters_outside_the_bmp(self):
+        self.assertEqual(self.read(codecs.BOM_UTF16_LE + "x \U0001F600".encode("utf-16-le")), "x \U0001F600")
+
+    def test_empty_file(self):
+        self.assertEqual(self.read(b""), "")
+
+    def test_bad_bytes(self):
+        self.assertEqual(self.read(b"caf\xe9"), "caf\ufffd")
+        with self.assertRaises(UnicodeDecodeError):
+            self.read(b"caf\xe9", errors="strict")
+
 
 class PasteChecks(unittest.TestCase):
     def test_comment_added_once(self):
@@ -235,6 +282,150 @@ class PasteChecks(unittest.TestCase):
         self.assertEqual(graphbuild.verify(sent, gone)["missing_nodes"], ["P_1"])
         custom = export.replace("K2Node_Event Name", "K2Node_CustomEvent Name")
         self.assertEqual(graphbuild.verify(sent, custom)["changed_class"][0]["now"], "K2Node_CustomEvent")
+
+
+def sent_graph(*nodes):
+    """Clipboard text. Each node is (name, pin line, ...)."""
+    out = []
+    for name, *pins in nodes:
+        out += [f'Begin Object Class=/Script/BlueprintGraph.K2Node_CallFunction Name="{name}"', *pins, "End Object"]
+    return "\n".join(out) + "\n"
+
+
+def export_of(*nodes):
+    """An export holding these nodes, as (name, pin line, ...), in the shape the editor writes."""
+    head = ['Begin Object Class=/Script/Engine.Blueprint Name="BP"', '  Begin Object Class=/Script/Engine.EdGraph Name="EventGraph"']
+    for name, *_ in nodes:
+        head += [f'    Begin Object Class=/Script/BlueprintGraph.K2Node_CallFunction Name="{name}"', "    End Object"]
+    head.append("  End Object")
+    body = ['  Begin Object Name="EventGraph"']
+    for name, *pins in nodes:
+        body += [f'    Begin Object Name="{name}"', *["      " + p for p in pins], "    End Object"]
+    body += [f"    Nodes({i})=\"/Script/BlueprintGraph.K2Node_CallFunction'{n[0]}'\"" for i, n in enumerate(nodes)]
+    return "\n".join(head + body + ["  End Object", "End Object"])
+
+
+class PureNodes(unittest.TestCase):
+    """A paste that gives a pure function exec pins: the editor takes them off and joins the chain around the node."""
+    DATA = pin("K3", "ReturnValue", "object", out=True)
+
+    def sent_chain(self):
+        return sent_graph(("E", pin("A1", "then", out=True, links="K A2,")),
+                          ("K", pin("A2", "execute", links="E A1,"), pin("A3", "then", out=True, links="N A4,"), self.DATA),
+                          ("N", pin("A4", "execute", links="K A3,")))
+
+    def test_chain_joined_around_it(self):
+        export = export_of(("E", pin("B1", "then", out=True, links="N B4,")), ("K", self.DATA), ("N", pin("B4", "execute", links="E B1,")))
+        r = graphbuild.verify(self.sent_chain(), export)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["missing_links"], [])
+        self.assertEqual(r["pure_nodes"], ["K"])
+        self.assertEqual(r["joined_links"], [{"from": "E.then", "to": "N.execute"}])
+        self.assertEqual(r["links_sent"], 2)
+
+    def test_chain_not_joined_is_still_a_failure(self):
+        export = export_of(("E", pin("B1", "then", out=True)), ("K", self.DATA), ("N", pin("B4", "execute")))
+        r = graphbuild.verify(self.sent_chain(), export)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["missing_links"], [{"from": "E.then", "to": "N.execute"}])
+        self.assertEqual(r["joined_links"], [])
+
+    def test_exec_pins_kept_but_links_gone_is_a_failure(self):
+        export = export_of(("E", pin("B1", "then", out=True)), ("K", pin("B2", "execute"), pin("B3", "then", out=True), self.DATA), ("N", pin("B4", "execute")))
+        r = graphbuild.verify(self.sent_chain(), export)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["pure_nodes"], [])
+        self.assertEqual(r["missing_links"], [{"from": "E.then", "to": "K.execute"}, {"from": "K.then", "to": "N.execute"}])
+
+    def test_orphaned_exec_pins_are_not_pure(self):
+        orphan = pin("B2", "execute").replace("bOrphanedPin=False", "bOrphanedPin=True")
+        export = export_of(("E", pin("B1", "then", out=True, links="N B4,")), ("K", orphan), ("N", pin("B4", "execute", links="E B1,")))
+        r = graphbuild.verify(self.sent_chain(), export)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["pure_nodes"], [])
+
+    def test_two_in_a_row(self):
+        sent = sent_graph(("E", pin("A1", "then", out=True, links="P A2,")),
+                          ("P", pin("A2", "execute", links="E A1,"), pin("A3", "then", out=True, links="K A4,")),
+                          ("K", pin("A4", "execute", links="P A3,"), pin("A5", "then", out=True, links="N A6,")),
+                          ("N", pin("A6", "execute", links="K A5,")))
+        export = export_of(("E", pin("B1", "then", out=True, links="N B6,")), ("P",), ("K",), ("N", pin("B6", "execute", links="E B1,")))
+        r = graphbuild.verify(sent, export)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["pure_nodes"], ["K", "P"])
+        self.assertEqual(r["joined_links"], [{"from": "E.then", "to": "N.execute"}])
+
+    def test_several_lead_into_it(self):
+        sent = sent_graph(("E1", pin("A1", "then", out=True, links="K A3,")), ("E2", pin("A2", "then", out=True, links="K A3,")),
+                          ("K", pin("A3", "execute", links="E1 A1,E2 A2,"), pin("A4", "then", out=True, links="N A5,")),
+                          ("N", pin("A5", "execute", links="K A4,")))
+        export = export_of(("E1", pin("B1", "then", out=True, links="N B5,")), ("E2", pin("B2", "then", out=True, links="N B5,")), ("K",),
+                           ("N", pin("B5", "execute", links="E1 B1,E2 B2,")))
+        r = graphbuild.verify(sent, export)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["joined_links"], [{"from": "E1.then", "to": "N.execute"}, {"from": "E2.then", "to": "N.execute"}])
+        one_side = export.replace('LinkedTo=(N B5,),', "", 1).replace("E1 B1,", "")
+        self.assertEqual(graphbuild.verify(sent, one_side)["missing_links"], [{"from": "E1.then", "to": "N.execute"}])
+
+    def test_then_to_two_nodes_only_the_first_is_joined(self):
+        sent = sent_graph(("E", pin("A1", "then", out=True, links="K A2,")),
+                          ("K", pin("A2", "execute", links="E A1,"), pin("A3", "then", out=True, links="N1 A4,N2 A5,")),
+                          ("N1", pin("A4", "execute", links="K A3,")), ("N2", pin("A5", "execute", links="K A3,")))
+        export = export_of(("E", pin("B1", "then", out=True, links="N1 B4,")), ("K",), ("N1", pin("B4", "execute", links="E B1,")), ("N2", pin("B5", "execute")))
+        r = graphbuild.verify(sent, export)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["joined_links"], [{"from": "E.then", "to": "N1.execute"}])
+        self.assertEqual(r["missing_links"], [{"from": "E.then", "to": "N2.execute"}])
+
+    def test_end_of_the_chain(self):
+        sent = sent_graph(("E", pin("A1", "then", out=True, links="K A2,")), ("K", pin("A2", "execute", links="E A1,"), pin("A3", "then", out=True)))
+        r = graphbuild.verify(sent, export_of(("E", pin("B1", "then", out=True)), ("K",)))
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((r["pure_nodes"], r["joined_links"]), (["K"], []))
+
+    def test_start_of_the_chain(self):
+        sent = sent_graph(("K", pin("A2", "execute"), pin("A3", "then", out=True, links="N A4,")), ("N", pin("A4", "execute", links="K A3,")))
+        r = graphbuild.verify(sent, export_of(("K",), ("N", pin("B4", "execute"))))
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((r["pure_nodes"], r["joined_links"]), (["K"], []))
+
+    def test_link_declared_on_one_side_only(self):
+        sent = sent_graph(("E", pin("A1", "then", out=True, links="K A2,")), ("K", pin("A2", "execute"), pin("A3", "then", out=True, links="N A4,")),
+                          ("N", pin("A4", "execute")))
+        export = export_of(("E", pin("B1", "then", out=True, links="N B4,")), ("K",), ("N", pin("B4", "execute", links="E B1,")))
+        r = graphbuild.verify(sent, export)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["pure_nodes"], ["K"])
+
+    def test_next_node_outside_the_paste(self):
+        sent = sent_graph(("E", pin("A1", "then", out=True, links="K A2,")),
+                          ("K", pin("A2", "execute", links="E A1,"), pin("A3", "then", out=True, links="Elsewhere ZZ,")))
+        r = graphbuild.verify(sent, export_of(("E", pin("B1", "then", out=True)), ("K",)))
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((r["missing_links"], r["joined_links"]), ([], []))
+
+    def test_exec_wired_to_a_data_pin_still_fails(self):
+        sent = sent_graph(("E", pin("A1", "then", out=True, links="C A2,")), ("C", pin("A2", "InInt", "int", links="E A1,")))
+        r = graphbuild.verify(sent, export_of(("E", pin("B1", "then", out=True)), ("C", pin("B2", "InInt", "int"))))
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["pure_nodes"], [])
+        self.assertEqual(r["missing_links"], [{"from": "C.InInt", "to": "E.then"}])
+
+    def test_data_link_of_a_pure_node_still_counts(self):
+        sent = sent_graph(("E", pin("A1", "then", out=True, links="K A2,")),
+                          ("K", pin("A2", "execute", links="E A1,"), pin("A3", "ReturnValue", "object", out=True, links="L A4,")),
+                          ("L", pin("A4", "TargetArray", "object", links="K A3,")))
+        export = export_of(("E", pin("B1", "then", out=True)), ("K", pin("B3", "ReturnValue", "object", out=True)), ("L", pin("B4", "TargetArray", "object")))
+        r = graphbuild.verify(sent, export)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["pure_nodes"], ["K"])
+        self.assertEqual(r["missing_links"], [{"from": "K.ReturnValue", "to": "L.TargetArray"}])
+
+    def test_ordinary_paste_has_no_pure_nodes(self):
+        sent = sent_graph(("P_0", pin("A1", "then", out=True, links="P_1 B1,")), ("P_1", pin("B1", "execute", links="P_0 A1,")))
+        r = graphbuild.verify(sent, export_of(("P_0", pin("C1", "then", out=True, links="P_1 D1,")), ("P_1", pin("D1", "execute", links="P_0 C1,"))))
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((r["pure_nodes"], r["joined_links"]), ([], []))
 
 
 def full_pin(name, cat="exec", out=False, default=None):

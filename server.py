@@ -35,7 +35,7 @@ import graphbuild  # noqa: E402
 import paths     # noqa: E402
 
 SERVER_NAME = "abiotic-mod-editor"
-SERVER_VERSION = "2.3.1"
+SERVER_VERSION = "2.3.2"
 
 EDITOR_ROOT = paths.find_editor_root()          # None when no Mod Editor install was found
 EDITOR_EXE = paths.editor_exe(EDITOR_ROOT)
@@ -1135,14 +1135,13 @@ def t_export_t3d(args):
     r = run_json(PY_EXPORT_T3D, {"asset_path": path, "out_file": str(out).replace("\\", "/")}, timeout=120)
     if not r.get("ok"):
         return json.dumps(r), True
-    text = out.read_text(encoding="utf-8", errors="replace")
-    r.update(t3d_errors(text, args.get("node_prefix")))
-    r["bytes"] = len(text)
+    r.update(t3d_errors(bpscan.read_t3d(out), args.get("node_prefix")))
+    r["bytes"] = out.stat().st_size
     return json.dumps(r, indent=2)
 
 
 def t_t3d_errors(args):
-    text = args.get("text") or Path(args["file"]).read_text(encoding="utf-8", errors="replace")
+    text = args.get("text") or bpscan.read_t3d(args["file"])
     return json.dumps(t3d_errors(text, args.get("node_prefix")), indent=2)
 
 
@@ -1341,6 +1340,10 @@ def paste_checked(text, asset=None, win=None, xy=None, clear=False, settle=3.0, 
         report.update(verified=False, hint=DIALOG_OPEN)
         return report, True
     report["verified"] = True
+    if result["pure_nodes"]:
+        report["lint_warnings"] = check["warnings"] + [
+            f"{', '.join(result['pure_nodes'])}: a pure node has no exec pins, so the editor took off the ones in this text and joined the chain "
+            "around it (joined_links). That graph is right. Leave those pins out next time."]
     sent = {n["name"] for n in bpscan.parse_t3d(text)["nodes"]}
     reused = sorted({n["name"] for n in before["nodes"]} & sent)
     if reused and not clear:
@@ -1359,7 +1362,7 @@ def paste_checked(text, asset=None, win=None, xy=None, clear=False, settle=3.0, 
 
 
 def t_paste_graph(args):
-    text = args.get("text") or Path(args["file"]).read_text(encoding="utf-8-sig")
+    text = args.get("text") or bpscan.read_t3d(args["file"], errors="strict")
     win = _window(args) if args.get("window") else None
     xy = None
     if "x" in args and "y" in args:
@@ -1579,7 +1582,7 @@ def export_mod_t3d(path):
     r = run_json(PY_EXPORT_T3D, {"asset_path": path, "out_file": str(out).replace("\\", "/")}, timeout=120)
     if not r.get("ok"):
         raise RemoteError("export failed: " + json.dumps(r))
-    return out.read_text(encoding="utf-8", errors="replace")
+    return bpscan.read_t3d(out)
 
 
 def t_inspect_blueprint(args):
@@ -1788,7 +1791,8 @@ TOOLS = [
      "check, and brings the Event Graph forward if nothing arrives (for another graph, open its tab first). Lints first (duplicate pins, broken links) "
      "and adds a comment node at the end, because the editor drops the links of the last pasted node. clear = delete what's in the showing graph first "
      "(needs asset_path). compile = compile if the paste is clean. Paste in passes so custom events exist and are compiled before callers; calls to "
-     "missing functions are dropped. Prefer build_graph for new logic.",
+     "missing functions are dropped. A pure node given exec pins isn't a failure: the editor joins the chain around it (pure_nodes, joined_links). "
+     "Prefer build_graph for new logic.",
      dict(XY, window=WIN, asset_path=STR, text=STR, file=STR, clear=BOOL, settle_seconds=NUM, end_comment=BOOL, compile=BOOL, save=BOOL), []),
     ("open_asset", t_open_asset,
      "Open an asset's editor window (Blueprint, widget, material...) and return its window title for the other window tools. "
