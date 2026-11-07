@@ -73,6 +73,21 @@ def _type_text(cat, obj=None):
     return text
 
 
+def pin_type_fields(cat, obj=None, array=False):
+    """The PinType.* fields of a pin line for a category, an optional class, struct or enum path, and array-ness."""
+    cat, sub = _pin_type(cat)
+    fields = [f'PinType.PinCategory="{cat}"']
+    if sub:
+        fields.append(f'PinType.PinSubCategory="{sub}"')
+    if obj:
+        kind = ("/Script/CoreUObject.Class" if cat in ("object", "class", "softobject", "softclass")
+                else "/Script/CoreUObject.Enum" if cat in ("byte", "enum") else "/Script/CoreUObject.ScriptStruct")
+        fields.append(f"PinType.PinSubCategoryObject=\"{kind}'{obj}'\"")
+    if array:
+        fields.append("PinType.ContainerType=Array")
+    return ",".join(fields) + ","
+
+
 def _user_pin(p):
     """A custom event parameter: {name, cat, obj?, array?}."""
     if not p.get("name") or not p.get("cat"):

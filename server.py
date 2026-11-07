@@ -35,7 +35,7 @@ import graphbuild  # noqa: E402
 import paths     # noqa: E402
 
 SERVER_NAME = "abiotic-mod-editor"
-SERVER_VERSION = "2.4.0"
+SERVER_VERSION = "2.5.0"
 
 EDITOR_ROOT = paths.find_editor_root()          # None when no Mod Editor install was found
 EDITOR_EXE = paths.editor_exe(EDITOR_ROOT)
@@ -1204,7 +1204,65 @@ def t_check_upload(args):
 
 
 def t_editor_windows(args):
-    return json.dumps(wininput.editor_windows(), indent=2)
+    return json.dumps(wininput.editor_windows(bool(args.get("include_popups"))), indent=2)
+
+
+def _point(win, args, xk, yk):
+    f = 1 if args.get("window_pixels") else _LAST_SCALE.get(win["hwnd"], 1)
+    return int(round(float(args[xk]) * f)), int(round(float(args[yk]) * f))
+
+
+def _popup_note(pop):
+    """Where a popup sits, in the main window's pixels and on screen."""
+    try:
+        main = wininput.find_window()
+    except wininput.WinError:
+        return ""
+    l, t = main["rect"][:2]
+    pl, pt, pr, pb = pop["rect"]
+    return f"{pr - pl}x{pb - pt} at ({pl - l}, {pt - t}) in '{main['title']}' (screen {pl}, {pt})"
+
+
+def t_editor_menu(args):
+    """Open a menu with a click and return its picture: the popup is an untitled editor window of its own."""
+    win = _window(args)
+    x, y = _point(win, args, "x", "y")
+    button = args.get("button", "right")
+    before = {w["hwnd"] for w in wininput.editor_windows(True)}
+    if args.get("hover_x") is not None and args.get("hover_y") is not None:
+        wininput.focus(win)
+        wininput.hover(win, *_point(win, args, "hover_x", "hover_y"))
+        time.sleep(0.3)
+        wininput.click(win, x, y, button, focus_first=False)
+    else:
+        wininput.click(win, x, y, button)
+    deadline = time.time() + float(args.get("wait_seconds", 3))
+    new = []
+    while time.time() < deadline and not new:
+        time.sleep(0.2)
+        new = [w for w in wininput.popups() if w["hwnd"] not in before and wininput.menu_like(w)]   # not the button's tooltip
+    if not new:
+        return (f"Clicked {button} at window ({x}, {y}) in '{win['title']}', but no menu opened. "
+                f"Popups open: {[_popup_note(p) for p in wininput.popups()]}"), True
+    pop = wininput.largest_menu(new)
+    time.sleep(0.3)                                             # let it finish drawing
+    png, f, (w, h) = wininput.capture(pop, int(args.get("max_width", 1600)))
+    _LAST_SCALE[pop["hwnd"]] = f
+    SHOTS.mkdir(exist_ok=True)
+    (SHOTS / "menu.png").write_bytes(png)
+    note = (f"Menu open: popup '{pop['title']}', {_popup_note(pop)}; image scaled 1/{f}. Pick an item with "
+            f"editor_click(window='{pop['title']}', x, y) in this image's pixels, or editor_keys(keep_menu=true, keys=[...]) "
+            "(type-to-search menus take text); Escape closes it. Any click or key that focuses the window first closes the menu.")
+    return {"content": [{"type": "image", "data": base64.b64encode(png).decode(), "mimeType": "image/png"},
+                        {"type": "text", "text": note}], "isError": False}
+
+
+def t_editor_drag(args):
+    win = _window(args)
+    x1, y1 = _point(win, args, "x1", "y1")
+    x2, y2 = _point(win, args, "x2", "y2")
+    wininput.drag(win, x1, y1, x2, y2, args.get("button", "left"), focus_first=not args.get("keep_menu"))
+    return f"Dragged {args.get('button', 'left')} from window ({x1}, {y1}) to ({x2}, {y2}) in '{win['title']}'"
 
 
 def t_screenshot(args):
@@ -1216,6 +1274,8 @@ def t_screenshot(args):
     path.write_bytes(png)
     note = (f"Window '{win['title']}' {w}x{h}, image scaled 1/{f}. Click coordinates are image pixels "
             f"(editor_click scales them by {f}). Saved: {path}")
+    if win.get("popup"):
+        note += f" This is a popup (menu): {_popup_note(win)}."
     return {"content": [{"type": "image", "data": base64.b64encode(png).decode(), "mimeType": "image/png"},
                         {"type": "text", "text": note}], "isError": False}
 
@@ -1228,15 +1288,20 @@ def _scaled(win, args):
 def t_click(args):
     win = _window(args)
     x, y = _scaled(win, args)
-    wininput.click(win, x, y, args.get("button", "left"), bool(args.get("double")))
+    keep = bool(args.get("keep_menu")) or bool(win.get("popup"))
+    wininput.click(win, x, y, args.get("button", "left"), bool(args.get("double")), focus_first=not keep)
     return f"Clicked {args.get('button', 'left')}{' double' if args.get('double') else ''} at window ({x}, {y}) in '{win['title']}'"
 
 
 def t_keys(args):
     win = _window(args)
+    keep = bool(args.get("keep_menu")) or bool(win.get("popup"))
     if "x" in args and "y" in args:
-        wininput.click(win, *_scaled(win, args))
+        wininput.click(win, *_scaled(win, args), focus_first=not keep)
         time.sleep(0.3)
+    elif keep:
+        if not wininput.foreground_is_editor():
+            return "The Mod Editor is not in front, and focusing it would close the menu; not sending keys.", True
     else:
         wininput.focus(win)
     done = []
@@ -1790,6 +1855,286 @@ def t_build_graph(args):
     return json.dumps(report, indent=2), is_error
 
 
+# ---- workflows through the editor's menus -------------------------------------------
+# Python can't add a Blueprint variable or a function override in this editor, but its menus can, and a menu is a popup
+# window this server can open, picture and click. Positions are the default layout's, at 100% scaling, times the UI scale.
+
+HEADER_GREYS = ((47, 47, 47), (56, 56, 56))     # a My Blueprint section header's band down the panel's left edge, plain and hovered
+
+
+def section_headers(win):
+    """y centres of the My Blueprint panel's section headers (Graphs, Functions, Macros, ...) from the window's pixels."""
+    raw, w, h = wininput.pixels(win)
+    s = wininput.ui_scale(win)
+    x, out, start = int(8 * s), [], None
+    for y in range(int(240 * s), h):
+        band = wininput.pixel(raw, w, x, y) in HEADER_GREYS
+        if band and start is None:
+            start = y
+        elif not band and start is not None:
+            if y - start >= 24 * s:
+                out.append((start + y) // 2)
+            start = None
+    return out
+
+
+def open_menu_at(win, x, y, button="left", hover=None, wait=3.0):
+    """Click, wait for a popup to appear, return it (the largest new one) or None."""
+    before = {p["hwnd"] for p in wininput.popups()}
+    wininput.focus(win)
+    if hover:
+        wininput.hover(win, *hover)
+        time.sleep(0.3)
+    wininput.click(win, x, y, button, focus_first=False)
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        time.sleep(0.2)
+        new = [p for p in wininput.popups() if p["hwnd"] not in before and wininput.menu_like(p)]   # not the button's tooltip
+        if new:
+            time.sleep(0.3)
+            return wininput.largest_menu(new)
+    return None
+
+
+def save_popup(pop, name):
+    png, f, _ = wininput.capture(pop, 1600)
+    SHOTS.mkdir(exist_ok=True)
+    (SHOTS / name).write_bytes(png)
+    return str(SHOTS / name)
+
+
+def t_add_variable(args):
+    """A Blueprint member variable, the way the editor allows: paste a Set node for a variable that doesn't exist yet,
+    then pick "Create variable" from the node's context menu. The pin's type becomes the variable's."""
+    asset, name = args["asset_path"], args["name"]
+    before = bpscan.parse_t3d(export_mod_t3d(asset))["blueprint"].get("variables") or []
+    if name in before:
+        return json.dumps({"created": False, "note": f"{name} already exists", "variables": before}, indent=2)
+    pins = graphbuild.pin_type_fields(args.get("cat") or "int", args.get("obj"), bool(args.get("array")))
+    node = {"id": "set", "type": "raw", "kind": "K2Node_VariableSet",
+            "props": [f'VariableReference=(MemberName="{name}",bSelfContext=True)'],
+            "pins": [f'CustomProperties Pin (PinId={graphbuild.new_id()},PinName="execute",PinType.PinCategory="exec",)',
+                     f'CustomProperties Pin (PinId={graphbuild.new_id()},PinName="then",Direction="EGPD_Output",PinType.PinCategory="exec",)',
+                     f'CustomProperties Pin (PinId={graphbuild.new_id()},PinName="{name}",{pins})']}
+    node_name = "McpVar_" + uuid.uuid4().hex[:6]
+    rep, err = paste_checked(graphbuild.bare_text([(node_name, node)]), asset, end_comment=False, settle=1.5)
+    report = {"name": name, "paste": {k: rep.get(k) for k in ("ok", "at", "spot", "landed_in", "missing_nodes", "hint")}}
+    if err or not rep.get("ok"):
+        report.update(created=False, error="the Set node didn't arrive, so there was nothing to right-click")
+        return json.dumps(report, indent=2), True
+    ax, ay = rep["at"]
+    win = wininput.find_window(rep["window"])
+    s = wininput.ui_scale(win)
+    title = (ax + int(50 * s), ay + int(6 * s))           # the pasted node's top-left is the paste click; its title bar runs right of it
+    wininput.click(win, *title)
+    time.sleep(0.3)
+    pop = open_menu_at(win, *title, button="right")
+    if pop is None:
+        report.update(created=False, error="right-clicking the node's title opened no menu", node=node_name)
+        return json.dumps(report, indent=2), True
+    report["menu"] = save_popup(pop, "add_variable_menu.png")
+    wininput.click(pop, int(100 * s), int(42 * s), focus_first=False)      # "Create variable 'X'", the first item
+    time.sleep(0.8)
+    after = bpscan.parse_t3d(export_mod_t3d(asset))["blueprint"].get("variables") or []
+    report.update(created=name in after, variables=after)
+    if not report["created"]:
+        report["error"] = "the menu item didn't create the variable; look at the menu picture"
+        return json.dumps(report, indent=2), True
+    if not args.get("keep_node"):
+        wininput.click(win, *title)
+        time.sleep(0.3)
+        wininput.keys("delete")
+        time.sleep(0.8)
+        still = [n["name"] for n in bpscan.parse_t3d(export_mod_t3d(asset))["nodes"] if n["name"] == node_name]
+        report["node_removed"] = not still
+    else:
+        report["node"] = node_name
+    if args.get("compile", True):
+        report["compile"] = compile_blueprint(asset, args.get("save", True))
+    return json.dumps(report, indent=2), False
+
+
+def display_name(fn):
+    """How the editor shows a function name: words split at capitals and underscores (CanJump -> Can Jump, InteractWith_A ->
+    Interact With A). A function with its own display name (meta DisplayName) differs; the menu picture shows those."""
+    words = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", fn.replace("_", " "))
+    return re.sub(r"\s+", " ", words).strip()
+
+
+def t_override_function(args):
+    """Override a parent function or event through My Blueprint's Override menu: hover the Functions header, open the
+    dropdown that appears, type the name, pick the match."""
+    asset, fn = args["asset_path"], args.get("function") or ""
+    list_only = bool(args.get("list_only"))
+    export = export_mod_t3d(asset)
+
+    def present(text):
+        return bool(re.search(r"(?:FunctionGraphs|UbergraphPages)\(\d+\)=\"[^\"]*'" + re.escape(fn) + "'\"", text)
+                    or re.search(r'EventReference=\([^\n]*MemberName="' + re.escape(fn) + '"', text))
+
+    if fn and present(export):
+        return json.dumps({"overridden": False, "note": f"{fn} is already a graph or event of this Blueprint"}, indent=2)
+    if not fn and not list_only:
+        return "Pass function (the parent's function or event name), or list_only=true to see the menu.", True
+    win, info = open_asset_window(asset)
+    index = 1 if "UbergraphPages(0)=" in export else 0        # Functions is the second section when there is a Graphs section
+    headers = []
+    wininput.focus(win)
+    wininput.hover(win, 400, 10)                               # off the panel: a hovered header is drawn in another grey
+    for _ in range(12):                                        # a window that has just opened takes a moment to paint its panels
+        headers = section_headers(win)
+        if len(headers) > index:
+            break
+        time.sleep(0.5)
+    report = {"function": fn, "window": win["title"], "section_headers_y": headers}
+    if len(headers) <= index:
+        report.update(overridden=False, error="couldn't find the Functions header in the My Blueprint panel (is the panel in its default place, on the left?)")
+        return json.dumps(report, indent=2), True
+    s = wininput.ui_scale(win)
+    hy = headers[index]
+    wininput.focus(win)
+    wininput.hover(win, int(200 * s), hy)
+    time.sleep(0.5)
+    raw, w, h = wininput.pixels(win)
+    # The button is a dark box (about x 269..345 at 100%) with light text in it, so count its dark pixels rather than read one.
+    dark = sum(1 for x in range(int(266 * s), int(346 * s)) if wininput.pixel(raw, w, x, hy)[0] <= 20)
+    report["override_button_dark_pixels"] = dark
+    if dark < 15 * s:
+        report.update(overridden=False, error=f"no Override button appeared on the header at y={hy} (hovering shows it when the parent has overridable functions)")
+        return json.dumps(report, indent=2), True
+    pop = open_menu_at(win, int(300 * s), hy, hover=(int(200 * s), hy))
+    if pop is None:
+        report.update(overridden=False, error="the Override button opened no menu")
+        return json.dumps(report, indent=2), True
+    def refresh(pop):
+        return next((p for p in wininput.popups() if p["hwnd"] == pop["hwnd"]), None) or wininput.find_window("popup")
+
+    def rows_of(pop):
+        """Matching entries, from the popup's height: the search box alone is about 36 px, each row about 26, at 100%."""
+        return max(0, round(((pop["rect"][3] - pop["rect"][1]) - 36 * s) / (26 * s)))
+
+    # The list shows a native function by its display name with no spaces added (CanJump, ActorEndOverlap, End Play) and a
+    # Blueprint parent's function with spaces (Activate Ragdoll), and the box matches a substring. So try the name's forms at
+    # full length first, an exact single match preferred, and only then shorten the first form until something matches.
+    def show(text):
+        nonlocal pop
+        wininput.keys("ctrl+a")
+        if text:
+            wininput.type_text(text)
+        else:
+            wininput.keys("delete")
+        time.sleep(0.6)
+        pop = refresh(pop)
+        return rows_of(pop)
+
+    stripped = re.sub(r"^(Receive|K2_)", "", fn)
+    candidates = [args["search"]] if args.get("search") is not None else [c for c in dict.fromkeys((stripped, fn, display_name(stripped))) if c]
+    typed, rows, first_hit = None, rows_of(pop), None
+    for cand in candidates:
+        rows = show(cand)
+        if rows == 1:
+            typed = cand
+            break
+        if rows and first_hit is None:
+            first_hit = (cand, rows)
+    if typed is None and first_hit is None and candidates and candidates[0]:
+        text = candidates[0]
+        while len(text) > 3:
+            text = text[:-1]
+            rows = show(text)
+            if rows:
+                typed = text
+                break
+    if typed is None and first_hit is not None:
+        typed, rows = first_hit
+        if show(typed) != rows:
+            rows = rows_of(pop)
+    report.update(typed=typed, rows=rows)
+    report["menu"] = save_popup(pop, "override_menu.png")
+    if list_only or typed is None or (rows > 1 and args.get("downs") is None):
+        wininput.keys("esc")
+        time.sleep(0.3)
+        report["overridden"] = False
+        if list_only:
+            report["note"] = "list_only: the menu picture shows the parent's overridable functions" + (f" matching '{typed}'" if typed else "") + "; nothing was changed."
+            return json.dumps(report, indent=2), False
+        if typed is None:
+            report["error"] = (f"no entry matched '{candidates[0]}' or any shorter start of it. The menu lists the parent's overridable functions by "
+                               "the name the editor shows: pass search=<that text>, or list_only=true with search='' to see them all.")
+        else:
+            report["error"] = (f"{rows} entries match '{typed}' (see the menu picture, top to bottom; the list is sorted by name, so an exact "
+                               "name usually comes first): pass downs=N to pick the Nth, with function=<its internal name>, or a longer search.")
+        return json.dumps(report, indent=2), True
+    for _ in range(int(args.get("downs") or 1)):
+        wininput.keys("down")
+        time.sleep(0.15)
+    wininput.keys("enter")
+    time.sleep(1.5)
+    after = export_mod_t3d(asset)
+    report["overridden"] = present(after)
+    if not report["overridden"]:
+        report["error"] = (f"a row was picked but nothing named {fn} appeared; the menu picture shows the rows matching '{typed}': "
+                           "pass downs=N to pick the Nth row, and function=<the internal name> of that row")
+        return json.dumps(report, indent=2), True
+    report["kind"] = "function graph" if re.search(r"FunctionGraphs\(\d+\)=\"[^\"]*'" + re.escape(fn) + "'\"", after) else "event"
+    if args.get("compile", True):
+        report["compile"] = compile_blueprint(asset, args.get("save", True))
+    return json.dumps(report, indent=2), False
+
+
+AUDIT_LINE = re.compile(r"AssetAudit|AuditModAssets", re.I)
+AUDIT_DONE = re.compile(r"Asset audit complete: (\d+) Error\(s\), (\d+) Warning\(s\), took ([\d.]+ ?m?s)")
+
+
+def t_run_asset_audit(args):
+    """The editor's own Asset Audit of the open mod, from the toolbar's flask menu; the result is read from the log."""
+    main = wininput.find_window()
+    s = wininput.ui_scale(main)
+    width = main["rect"][2] - main["rect"][0]
+    if width < 1150 * s:
+        return f"The main window is {width} px wide; below about 1150 the flask button is behind the toolbar's >> overflow. Widen it.", True
+    mark = log_mark()
+    before_windows = window_titles()
+    pop = open_menu_at(main, int(934 * s), int(78 * s), hover=(int(700 * s), int(78 * s)))
+    if pop is None:
+        return "The toolbar's flask menu didn't open at (934, 78); take an editor_screenshot of the main window to see the toolbar.", True
+    menu = save_popup(pop, "audit_menu.png")
+    wininput.click(pop, int(100 * s), int(106 * s), focus_first=False)   # "Audit mod assets"
+    deadline = time.time() + float(args.get("timeout_seconds", 900))
+    lines, changed, done = [], time.time(), None
+    while time.time() < deadline:
+        time.sleep(1.0)
+        now = [l for l in log_since(mark) if AUDIT_LINE.search(l)]
+        if len(now) != len(lines):
+            lines, changed = now, time.time()
+        done = next((m for l in lines for m in [AUDIT_DONE.search(l)] if m), None)
+        if done or (lines and time.time() - changed > float(args.get("quiet_seconds", 6))):
+            break
+    strip = re.compile(r"^\[[^\]]*\]\[\s*\d+\]")
+    report = {"menu": menu, "lines": len(lines),
+              "errors": [l.split("AssetAudit:", 1)[-1].strip() for l in lines if re.search(r"AssetAudit: Error", l)],
+              "warnings": [l.split("AssetAudit:", 1)[-1].strip() for l in lines if re.search(r"AssetAudit: Warning", l)],
+              "other": [strip.sub("", l).strip() for l in lines if not re.search(r"AssetAudit: (Error|Warning)", l)][-30:],
+              "new_windows": sorted(window_titles() - before_windows)}
+    report["ran"] = bool(lines)
+    if done:
+        report["summary"] = {"errors": int(done.group(1)), "warnings": int(done.group(2)), "took": done.group(3)}
+        found = next((re.search(r"Found (\d+) assets", l) for l in lines if "Found" in l), None)
+        if found:
+            report["summary"]["assets"] = int(found.group(1))
+    elif lines:
+        report["note"] = "No completion line within the wait: the audit may still be running; read_editor_log(contains='AssetAudit') later."
+    else:
+        report["note"] = "No audit lines reached the log: the menu item may have missed. See the menu picture; the item is the fourth row."
+    if "Message Log" in report["new_windows"] and args.get("close_message_log", True):
+        try:
+            wininput.close_window(wininput.find_window("Message Log"))      # it opens to show the same lines; the log already has them
+            report["message_log"] = "closed"
+        except wininput.WinError:
+            pass
+    return json.dumps(report, indent=2), not lines or bool(report["errors"])
+
+
 def t_play_in_editor(args):
     action = args.get("action", "start")
     if action == "stop":
@@ -2008,17 +2353,31 @@ TOOLS = [
      "/Game references that exist only in the editor (cloud cook fails), .uplugin version. Give mod_dir, or mod_root of an open mod.",
      S(mod_dir=STR, mod_root=STR), []),
     ("editor_windows", t_editor_windows,
-     "List the Mod Editor's open windows (main editor, asset editors, Mod Browser, PIE, dialogs).", S(), []),
+     "List the Mod Editor's open windows (main editor, asset editors, Mod Browser, PIE, dialogs). include_popups adds its untitled popup "
+     "windows (an open menu, tooltips) as '<popup N>', topmost first.", S(include_popups=BOOL), []),
+    ("editor_menu", t_editor_menu,
+     "Open a menu by clicking (right-click a node's title for its context menu, left-click a toolbar or dropdown button) and return the "
+     "menu's picture: it is a popup window of its own. hover_x/hover_y: a spot to hover first (toolbar buttons want it). Then pick an item with "
+     "editor_click(window='popup', x, y) in the picture's pixels, or editor_keys(keep_menu=true, keys=['down', 'enter'], text=...); "
+     "Escape closes it. A click or key that focuses a window first closes any open menu.",
+     dict(XY, window=WIN, button={"type": "string", "enum": ["left", "right"]}, hover_x=NUM, hover_y=NUM, wait_seconds=NUM, max_width=INT), ["x", "y"]),
+    ("editor_drag", t_editor_drag,
+     "Drag the mouse from one point to another in a Mod Editor window, in steps: wires a pin to a pin (a pasted node to a function's entry, "
+     "say), pans a graph with the right button. x1/y1/x2/y2 are pixels in that window's latest editor_screenshot image.",
+     dict(x1=NUM, y1=NUM, x2=NUM, y2=NUM, window=WIN, button={"type": "string", "enum": ["left", "right"]},
+          window_pixels={"type": "boolean", "description": "x/y are real window pixels, not screenshot pixels."}, keep_menu=BOOL), ["x1", "y1", "x2", "y2"]),
     ("editor_screenshot", t_screenshot,
      "Screenshot ONE Mod Editor window (never the desktop) and return the image. Works with the window in the background.",
      S(window=WIN, max_width=INT, save_as=STR), []),
     ("editor_click", t_click,
-     "Click in a Mod Editor window. x/y are pixels in that window's latest editor_screenshot image.",
-     dict(XY, window=WIN, button={"type": "string", "enum": ["left", "right"]}, double=BOOL), ["x", "y"]),
+     "Click in a Mod Editor window. x/y are pixels in that window's latest editor_screenshot image. window='popup' clicks in the open menu "
+     "(its editor_menu picture's pixels); keep_menu=true clicks elsewhere without focusing first, which would close an open menu.",
+     dict(XY, window=WIN, button={"type": "string", "enum": ["left", "right"]}, double=BOOL, keep_menu=BOOL), ["x", "y"]),
     ("editor_keys", t_keys,
      "Focus a Mod Editor window (optionally click x/y first), then press key combos (e.g. ['ctrl+s'], ['alt+p'], ['delete']), "
-     "type text, and/or press Enter. Keys only go to the editor when it is in front. In PIE hold keys 300 ms+ (hold_ms).",
-     dict(XY, window=WIN, keys={"type": "array", "items": STR}, text=STR, press_enter=BOOL, hold_ms=INT), []),
+     "type text, and/or press Enter. Keys only go to the editor when it is in front. In PIE hold keys 300 ms+ (hold_ms). "
+     "keep_menu=true (or window='popup') sends them without focusing first, so an open menu stays open: arrows, Enter, Escape, or text for a menu that searches.",
+     dict(XY, window=WIN, keys={"type": "array", "items": STR}, text=STR, press_enter=BOOL, hold_ms=INT, keep_menu=BOOL), []),
     ("paste_graph", t_paste_graph,
      "Paste Blueprint clipboard text (T3D nodes) into the graph showing in a Blueprint's window, then read the Blueprint back and "
      "report any nodes or links that didn't arrive, and which graph they landed in. Give asset_path: it opens the Blueprint and enables the "
@@ -2058,6 +2417,23 @@ TOOLS = [
      "spec_file: JSON file with nodes and links (and merge/graph/asset_path), for big graphs.",
      S(nodes={"type": "array", "items": OBJ}, links={"type": "array", "items": {"type": "array", "items": STR}}, spec_file=STR, asset_path=STR,
        parent_class=STR, prefix=STR, out_file=STR, paste=BOOL, clear=BOOL, compile=BOOL, save=BOOL, merge=BOOL, graph=STR, settle_seconds=NUM), []),
+    ("add_variable", t_add_variable,
+     "Add a member variable to a mod Blueprint (Python can't): pastes a Set node for it, picks 'Create variable' from the node's menu, "
+     "removes the node (unless keep_node) and compiles. cat: bool, int, int64, real (float), byte, string, name, text, object/class/softobject/softclass "
+     "(obj = class path), struct (obj = struct path), byte with obj = enum path; array=true for an array. The Blueprint's Event Graph must be showing.",
+     S(asset_path=STR, name=STR, cat=STR, obj=STR, array=BOOL, keep_node=BOOL, compile=BOOL, save=BOOL), ["asset_path", "name"]),
+    ("override_function", t_override_function,
+     "Override a parent function or event in a mod Blueprint through My Blueprint's Override menu: finds the Functions header, hovers it, opens "
+     "the dropdown, types the name as the list shows it (a native function by its display name without spaces, an event without its Receive "
+     "prefix, a Blueprint parent's function with spaces: all three forms are tried, then shorter starts) or search, and picks a single match "
+     "(downs = which row when several match); reads the Blueprint back to confirm. list_only=true just returns the menu's picture "
+     "(search='' shows every overridable function). Needs the default panel layout.",
+     S(asset_path=STR, function=STR, search=STR, downs=INT, list_only=BOOL, compile=BOOL, save=BOOL), ["asset_path"]),
+    ("run_asset_audit", t_run_asset_audit,
+     "Run the editor's own Asset Audit of the open mod (the upload's first check) from the toolbar's flask menu, and return what it logged: "
+     "errors, warnings, the rest, and a summary from its completion line. Waits for that line, or until the log goes quiet (quiet_seconds, "
+     "default 6) or timeout_seconds (900). Closes the Message Log it opens unless close_message_log=false. The main window must be about "
+     "1150 px wide or more.", S(timeout_seconds=NUM, quiet_seconds=NUM, close_message_log=BOOL), []),
     ("play_in_editor", t_play_in_editor,
      "Start (Alt+P in the main window) or stop Play In Editor. Load a real map first (e.g. /Game/Maps/Facility); close the Message Log first.",
      S(action={"type": "string", "enum": ["start", "stop"]}, wait_seconds=NUM), []),
@@ -2109,7 +2485,8 @@ INSTRUCTIONS = (
     "Python cannot create Blueprint nodes: use build_graph (it checks every pin against the editor), which pastes and verifies (merge=true links new nodes to a graph's existing ones); "
     "paste_graph takes T3D you already have. compile_blueprint reports compiler errors. "
     "Copied game Blueprints must pass the upload Asset Audit (Blueprint filter) and the cloud cook; run check_upload before an upload. "
-    "Screenshots are per editor window only. The user does mod.io uploads."
+    "Screenshots are per editor window only. Menus are popup windows: editor_menu opens one and shows it, editor_click(window='popup') picks. "
+    "add_variable, override_function and run_asset_audit drive the editor's menus for what Python can't do. The user does mod.io uploads."
 )
 
 

@@ -5,6 +5,7 @@ screenshot can never include the rest of the desktop.
 """
 import ctypes
 import ctypes.wintypes as wt
+import re
 import struct
 import time
 import zlib
@@ -74,8 +75,9 @@ def _rect(h):
     return r.left, r.top, r.right, r.bottom
 
 
-def editor_windows():
-    """Visible top-level windows owned by the Mod Editor process."""
+def editor_windows(popups=False):
+    """Visible top-level windows owned by the Mod Editor process. With popups, its untitled windows too (menus, and
+    tooltips), titled '<popup N>' in z-order with N=1 on top: those are what a context menu or a dropdown is."""
     found = []
     exe_cache = {}
 
@@ -84,27 +86,58 @@ def editor_windows():
         if not user32.IsWindowVisible(h):
             return True
         n = user32.GetWindowTextLengthW(h)
-        if n == 0:
+        if n == 0 and not popups:
             return True
         pid = wt.DWORD()
         user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
         exe = exe_cache.setdefault(pid.value, _exe_of(pid.value))
         if EDITOR_EXE.lower() not in exe.lower():
             return True
+        l, t, r, b = _rect(h)
+        if n == 0:
+            if r - l > 20 and b - t > 20:
+                found.append({"hwnd": int(h), "title": "", "pid": pid.value, "rect": [l, t, r, b], "minimized": False, "popup": True})
+            return True
         buf = ctypes.create_unicode_buffer(n + 1)
         user32.GetWindowTextW(h, buf, n + 1)
-        l, t, r, b = _rect(h)
         if r - l > 50 and b - t > 50:
             found.append({"hwnd": int(h), "title": buf.value, "pid": pid.value,
                           "rect": [l, t, r, b], "minimized": bool(user32.IsIconic(h))})
         return True
 
     user32.EnumWindows(cb, 0)
+    for i, w in enumerate(w for w in found if w.get("popup")):
+        w["title"] = f"<popup {i + 1}>"
     return found
+
+
+def popups():
+    """The editor's untitled popup windows (menus, tooltips), topmost first."""
+    return [w for w in editor_windows(True) if w.get("popup")]
+
+
+def menu_like(w):
+    """A popup shaped like a menu rather than a tooltip: tooltips are wide strips, more than five times wider than tall."""
+    return (w["rect"][2] - w["rect"][0]) <= 5 * (w["rect"][3] - w["rect"][1])
+
+
+def largest_menu(pops):
+    """The biggest menu-shaped popup, else the biggest popup, else None."""
+    pops = list(pops)
+    menus = [w for w in pops if menu_like(w)] or pops
+    return max(menus, key=lambda w: (w["rect"][2] - w["rect"][0]) * (w["rect"][3] - w["rect"][1])) if menus else None
 
 
 def find_window(title=None):
     """Editor window whose title contains `title` (case-insensitive); default = the main editor window."""
+    if title and title.lower().lstrip("<").startswith("popup"):
+        pops = popups()
+        if not pops:
+            raise WinError("No editor popup (menu) is open.")
+        m = re.search(r"(\d+)", title)
+        if m:                                   # '<popup N>': that one, in z-order
+            return pops[min(int(m.group(1)), len(pops)) - 1]
+        return largest_menu(pops)                                       # 'popup': the menu, not a tooltip
     wins = editor_windows()
     if not wins:
         raise WinError("No Mod Editor window is open.")
@@ -226,12 +259,33 @@ VK = {"ctrl": 0x11, "shift": 0x10, "alt": 0x12, "win": 0x5B, "enter": 0x0D, "ret
 EXTENDED = {0x2E, 0x2D, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28}
 
 
-def click(win, x, y, button="left", double=False):
-    """Click at window-relative pixel (x, y)."""
+def _bring_or_check(win, focus_first):
+    """Focus the window, or, to keep an open menu open (focusing closes it), only check the editor is already in front."""
+    if focus_first and not win.get("popup"):
+        focus(win)
+    elif not foreground_is_editor():
+        raise WinError("The Mod Editor is not the foreground window, and bringing it to the front would close any open menu; "
+                       "click without keep_menu first.")
+
+
+def hover(win, x, y):
+    """Move the mouse to a window pixel with a one-pixel wiggle, so the editor registers the hover."""
+    l, t, _, _ = _rect(win["hwnd"])
+    user32.SetCursorPos(l + x, t + y)
+    time.sleep(0.12)
+    user32.SetCursorPos(l + x + 1, t + y)
+    time.sleep(0.12)
+    user32.SetCursorPos(l + x, t + y)
+    time.sleep(0.15)
+
+
+def click(win, x, y, button="left", double=False, focus_first=True):
+    """Click at window-relative pixel (x, y). focus_first=False keeps an open menu open: a popup window never takes
+    focus first, and a normal window is only clicked when the editor is already in front."""
     l, t, r, b = _rect(win["hwnd"])
     if not (0 <= x < r - l and 0 <= y < b - t):
         raise WinError(f"({x}, {y}) is outside the window ({r - l}x{b - t})")
-    focus(win)
+    _bring_or_check(win, focus_first)
     user32.SetCursorPos(l + x, t + y)
     time.sleep(0.15)
     down, up = (0x2, 0x4) if button == "left" else (0x8, 0x10)
@@ -240,6 +294,25 @@ def click(win, x, y, button="left", double=False):
         time.sleep(0.03)
         user32.mouse_event(up, 0, 0, 0, 0)
         time.sleep(0.08)
+
+
+def drag(win, x1, y1, x2, y2, button="left", focus_first=True, steps=12):
+    """Drag with the mouse from one window pixel to another, in steps, as a hand would: wires a pin to a pin, pans."""
+    l, t, r, b = _rect(win["hwnd"])
+    for x, y in ((x1, y1), (x2, y2)):
+        if not (0 <= x < r - l and 0 <= y < b - t):
+            raise WinError(f"({x}, {y}) is outside the window ({r - l}x{b - t})")
+    _bring_or_check(win, focus_first)
+    hover(win, x1, y1)
+    down, up = (0x2, 0x4) if button == "left" else (0x8, 0x10)
+    user32.mouse_event(down, 0, 0, 0, 0)
+    time.sleep(0.15)
+    for s in range(1, steps + 1):
+        user32.SetCursorPos(l + x1 + (x2 - x1) * s // steps, t + y1 + (y2 - y1) * s // steps)
+        time.sleep(0.03)
+    time.sleep(0.2)
+    user32.mouse_event(up, 0, 0, 0, 0)
+    time.sleep(0.4)
 
 
 def keys(combo, hold_ms=50):

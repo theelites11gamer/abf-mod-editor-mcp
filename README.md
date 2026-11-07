@@ -39,7 +39,7 @@ The editor's Python plugin has a "remote execution" mode (UDP discovery on 239.0
 
 The server uses remote execution first and the bridge second, opens a fresh connection per command (so it can share the editor with other tools), and reports a command that was sent but got no reply instead of retrying it.
 
-## Tools (37)
+## Tools (42)
 
 | Group | Tools |
 | --- | --- |
@@ -48,15 +48,16 @@ The server uses remote execution first and the bridge second, opens a fresh conn
 | Mod data | `list_mods`, `list_mod_templates`, `find_assets`, `get_row`, `set_row` (plain values, Python expressions, or whole export text), `create_row_asset` (any of the 72 `*ModRowAsset` classes, optionally copied from a base-game row or another mod row), `delete_asset`, `save_assets`, `validate_assets` |
 | Base-game data | `get_game_row` — list or read any row the game exposes through its `<Kind>HandleFunctionLibrary` (gear_item, weapon_item, recipe, buff_debuff, npc, pet, trait, …) |
 | Blueprints | `build_graph` (node list → graph, every pin checked against the editor; `merge` links new nodes to a graph's existing ones), `discover_pins` (the real pins of any node), `paste_graph` (clipboard T3D → graph, then checks what arrived), `compile_blueprint` (reports the compiler's errors; a Blueprint with errors isn't saved), `inspect_blueprint` (parent, variables, graphs, every reference, errors, nodes and pins), `export_t3d`, `t3d_errors`, `blueprint_filter_check` |
-| Window | `open_asset`, `close_asset`, `editor_windows`, `editor_screenshot` (one editor window, returned as an image, works in the background), `editor_click`, `editor_keys`, `close_editor_window` |
+| Window | `open_asset`, `close_asset`, `editor_windows` (with the open menu and other popups on request), `editor_screenshot` (one editor window, returned as an image, works in the background), `editor_click`, `editor_keys`, `editor_menu` (open a context menu or dropdown and get its picture), `editor_drag` (wire a pin to a pin), `close_editor_window` |
 | Map and play | `load_map`, `play_in_editor` start/stop, `pie_info` (players, pawns, locations, chosen pawn properties), `console_command` (editor or game world) |
+| Menus | `add_variable` (a Blueprint member variable, through the Set node's context menu), `override_function` (a parent function or event, through the Override menu), `run_asset_audit` (the editor's own Asset Audit, from the toolbar's flask menu) |
 | Release | `check_upload` (offline pre-upload check), `read_editor_log` |
 
 ### Safety rails built in
 
 - Refuses to edit, save, delete or T3D-export anything under `/Game` (base content). Exporting a base-game Blueprint has crashed the editor.
 - Screenshots capture one editor window, never the desktop.
-- Keys and text are only sent while the editor is the foreground window.
+- Keys and text are only sent while the editor is the foreground window. A menu closes when a window is focused, so clicks and keys meant for one (`window='popup'`, `keep_menu`) are sent only when the editor is already in front.
 - `delete_asset` deletes one asset per call: a delete loop crashed the editor.
 - Nothing uploads to mod.io. You do that in the editor.
 
@@ -110,6 +111,16 @@ Existing nodes come back under new names, reported under `merge.renamed` (the de
 
 Limits: a function's entry and result nodes can't be re-pasted, so links to them are lost and listed under `merge.links_to_rewire` (wire those in the editor); a graph holding a Timeline or a collapsed graph can't be merged; the emptied graph is compiled before the paste when custom events are involved, so their names survive; the whole graph lands centred on the paste point, so it may move.
 
+### What the menus allow that Python doesn't
+
+The editor's Python can't add a member variable or override a parent function, and the real Asset Audit (the upload's first check) only runs from the toolbar. Its menus can do all three, and a menu is a popup window of the editor's own, so the server opens it, looks at it and clicks it:
+
+- `add_variable` pastes a Set node for a variable that doesn't exist yet, right-clicks its title and picks "Create variable" (the pin's type becomes the variable's), then removes the node and compiles. `cat` and `obj` are as for a custom event parameter; `array=true` for an array.
+- `override_function` hovers the Functions header of the My Blueprint panel, which shows the Override button, opens it and types the name as the list shows it: a native function by its display name with no spaces (`CanJumpInternal` is `CanJump`), an event without its `Receive` prefix (`ActorEndOverlap`), a Blueprint parent's function with spaces (`Activate Ragdoll`). All three forms are tried, then shorter starts of the first; a single match is picked, several are reported with the menu's picture so `downs` can choose. `list_only` returns the picture of the whole list.
+- `run_asset_audit` opens the flask menu, picks "Audit mod assets", waits for the completion line in the log and returns the errors, warnings and a summary. It closes the Message Log the audit opens.
+
+These depend on the default window layout at 100% scaling (scaled by the monitor's UI scale) and on the menus the editor shows today; each reads the Blueprint or the log back to confirm, and says what it saw when it couldn't.
+
 ## Working notes
 
 - Mod row assets are `PrimaryDataAsset`s; `row_name` defaults to the asset name and the game adds the mod prefix at runtime.
@@ -128,6 +139,7 @@ Limits: a function's entry and result nodes can't be re-pasted, so links to them
 - A new mod project can't be created from Python (the template system has no entry point). Do it in the picker: ITEMS tile → template → name → Create. `editor_screenshot` + `editor_click`/`editor_keys` can drive it.
 - Loading a map opens the Message Log over the viewport; `close_editor_window("Message Log")` before Play In Editor.
 - The editor runs commands on its game thread: keep scripts short, and never open a modal dialog from one.
+- Menus (a node's context menu, a toolbar dropdown, the Override list) are untitled popup windows of the editor's own, and they close the moment another window is focused. `editor_menu` opens one and returns its picture; `editor_windows` lists them with `include_popups`; `editor_click` with `window='popup'` (image pixels of that picture) or `keep_menu=true`, and `editor_keys` with `keep_menu=true`, act without focusing first. Escape closes a menu.
 - A float pin is `real` with sub-category `double` in this engine. A custom event parameter or an `element` with cat `real` (or `float`, `double`) is written that way; written as `real` alone, it compiled as the wrong type ("Array of Floats").
 - An `event` of a class the Blueprint's parent doesn't descend from is refused before anything is pasted: the editor would turn it into a custom event with no parameters. Earlier versions cached that result and served it to later builds; such entries are dropped from `data/node-templates.json` now, and a probe whose node came back as a different class is reported as an error and never kept.
 - Probes (`build_graph`, `discover_pins`) don't run while Play In Editor is running: the throwaway Blueprint's window can't take the paste then.

@@ -655,6 +655,38 @@ class GraphBackground(unittest.TestCase):
             self.assertFalse(server.is_graph_background(rgb), rgb)
 
 
+class Menus(unittest.TestCase):
+    def test_display_name(self):
+        import server
+        self.assertEqual(server.display_name("ActivateRagdoll"), "Activate Ragdoll")
+        self.assertEqual(server.display_name("InteractWith_A"), "Interact With A")
+        self.assertEqual(server.display_name("CanJumpInternal"), "Can Jump Internal")
+        self.assertEqual(server.display_name("Tick"), "Tick")
+
+    def test_pin_type_fields(self):
+        self.assertEqual(graphbuild.pin_type_fields("float"), 'PinType.PinCategory="real",PinType.PinSubCategory="double",')
+        self.assertEqual(graphbuild.pin_type_fields("object", "/Script/Engine.Actor", True),
+                         "PinType.PinCategory=\"object\",PinType.PinSubCategoryObject=\"/Script/CoreUObject.Class'/Script/Engine.Actor'\",PinType.ContainerType=Array,")
+        self.assertIn("ScriptStruct'/Script/CoreUObject.Vector'", graphbuild.pin_type_fields("struct", "/Script/CoreUObject.Vector"))
+        self.assertIn("CoreUObject.Enum'", graphbuild.pin_type_fields("byte", "/Script/Engine.ECollisionChannel"))
+
+    def test_menu_like(self):
+        import wininput
+        tip = {"rect": [0, 0, 512, 78]}
+        menu = {"rect": [0, 0, 204, 170]}
+        one_row = {"rect": [0, 0, 268, 62]}
+        self.assertFalse(wininput.menu_like(tip))
+        self.assertTrue(wininput.menu_like(menu) and wininput.menu_like(one_row))
+        self.assertEqual(wininput.largest_menu([tip, menu]), menu)
+        self.assertEqual(wininput.largest_menu([tip]), tip)
+        self.assertIsNone(wininput.largest_menu([]))
+
+    def test_audit_completion_line(self):
+        import server
+        m = server.AUDIT_DONE.search("[2026.11.07-05.10.00:000][  1]AssetAudit: Asset audit complete: 2 Error(s), 1 Warning(s), took 123.321ms to complete.")
+        self.assertEqual((m.group(1), m.group(2), m.group(3)), ("2", "1", "123.321ms"))
+
+
 class Templates(unittest.TestCase):
     """server.py's template bookkeeping, with the editor faked out."""
 
