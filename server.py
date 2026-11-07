@@ -35,7 +35,7 @@ import graphbuild  # noqa: E402
 import paths     # noqa: E402
 
 SERVER_NAME = "abiotic-mod-editor"
-SERVER_VERSION = "2.5.0"
+SERVER_VERSION = "2.6.0"
 
 EDITOR_ROOT = paths.find_editor_root()          # None when no Mod Editor install was found
 EDITOR_EXE = paths.editor_exe(EDITOR_ROOT)
@@ -244,7 +244,10 @@ def _clean(text):
 def bridge_alive():
     try:
         beat = json.loads((BRIDGE / "heartbeat.json").read_text())
-        return time.time() - beat["time"] < 10
+        if time.time() - beat["time"] >= 10:
+            return False
+        pid = beat.get("pid")
+        return pid is None or int(pid) in wininput.editor_pids()     # an exiting editor's last beats mustn't pass for a new one's
     except Exception:
         return False
 
@@ -357,15 +360,47 @@ def _plugin_dir(root):
         return None
 '''
 
-PY_STATUS = PY_MOD_ROOTS + r'''
+# The play settings' net mode is a byte of an enum Python can't convert, but a text export of the settings object shows it.
+PY_PLAY_SETTINGS = r'''
+def _play_settings(path):
+    ps = unreal.find_object(None, "/Script/UnrealEd.Default__LevelEditorPlaySettings")
+    task = unreal.AssetExportTask()
+    for k, v in dict(object=ps, exporter=unreal.ObjectExporterT3D(), filename=path, automated=True, prompt=False, replace_identical=True).items():
+        setattr(task, k, v)
+    if not unreal.Exporter.run_asset_export_task(task):
+        return None
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+'''
+
+PY_STATUS = PY_MOD_ROOTS + PY_PLAY_SETTINGS + r'''
 def _abf(args):
-    world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
-    return {
+    sub = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+    world = sub.get_editor_world()
+    out = {
         "engine_version": unreal.SystemLibrary.get_engine_version(),
         "open_mods": [{"root": r, "dir": _plugin_dir(r)} for r in _mod_roots()],
         "editor_map": world.get_path_name() if world else None,
-        "play_in_editor": unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world() is not None,
+        "play_in_editor": sub.get_game_world() is not None,
     }
+    if args.get("full"):
+        lib = unreal.EditorLoadingAndSavingUtils
+        out["dirty_packages"] = {"content": [str(p.get_name()) for p in lib.get_dirty_content_packages()],
+                                 "maps": [str(p.get_name()) for p in lib.get_dirty_map_packages()]}
+        out["play_settings_text"] = _play_settings(args["settings_file"])
+    return out
+'''
+
+PY_SET_PLAY = PY_PLAY_SETTINGS + r'''
+def _abf(args):
+    ps = unreal.find_object(None, "/Script/UnrealEd.Default__LevelEditorPlaySettings")
+    out = {}
+    if args.get("net_mode") is not None:
+        unreal.get_default_object(unreal.SystemLibrary).call_method("SetBytePropertyByName", (ps, "PlayNetMode", int(args["net_mode"])))
+    if args.get("clients") is not None:
+        ps.set_editor_property("PlayNumberOfClients", int(args["clients"]))
+    out["play_settings_text"] = _play_settings(args["settings_file"])
+    return out
 '''
 
 PY_LIST_MODS = PY_MOD_ROOTS + r'''
@@ -837,11 +872,13 @@ SHIPPABLE = {".uasset", ".umap", ".uexp", ".ubulk", ".uplugin", ".abfmod", ".ini
 GAME_REF = re.compile(rb"/Game/[A-Za-z0-9_\-/]+(?:\.[A-Za-z0-9_\-]+)?")
 
 
-def check_upload(mod_dir):
+def check_upload(mod_dir, ignore=()):
+    """ignore: package paths, or parts of them, whose /Game references are known to be fine (the report lists them as ignored)."""
     root = Path(mod_dir)
     if not root.is_dir():
         raise RemoteError(f"Not a folder: {root}")
-    report = {"folder": str(root), "errors": [], "warnings": [], "files": 0, "size_mb": 0}
+    report = {"folder": str(root), "errors": [], "warnings": [], "ignored": [], "files": 0, "size_mb": 0}
+    ignore = [i for i in (ignore or ()) if i]
     uplugins = list(root.glob("*.uplugin"))
     if not uplugins:
         report["errors"].append("No .uplugin in the folder root (point this at the mod project folder).")
@@ -882,11 +919,16 @@ def check_upload(mod_dir):
                     missing.setdefault(pkg, []).append(rel)
     report["size_mb"] = round(total / 1048576, 2)
     for pkg, users in sorted(editor_only.items()):
-        report["errors"].append(f"{pkg}: exists only in the editor, not the retail game (cloud cook / runtime will fail); used by {sorted(set(users))[:5]}")
+        line = f"{pkg}: exists only in the editor, not the retail game (cloud cook / runtime will fail); used by {sorted(set(users))[:5]}"
+        (report["ignored"] if any(i in pkg for i in ignore) else report["errors"]).append(line)
     for pkg, users in sorted(missing.items()):
-        report["warnings"].append(f"{pkg}: not in the retail or editor asset list (may be a name, not a package); used by {sorted(set(users))[:5]}")
+        line = f"{pkg}: not in the retail or editor asset list (may be a name, not a package); used by {sorted(set(users))[:5]}"
+        (report["ignored"] if any(i in pkg for i in ignore) else report["warnings"]).append(line)
     if retail is None:
         report["warnings"].append("data/retail-1.5-files.json missing: /Game reference check skipped")
+    note = version_mismatch(paths.editor_version(), lists_version())
+    if note:
+        report["warnings"].append(note)
     report["verdict"] = "FAIL" if report["errors"] else ("CHECK WARNINGS" if report["warnings"] else "OK")
     report["note"] = ("Offline pre-check only. The editor's own upload Asset Audit (Blueprint filter) "
                       "and mod.io's cloud cook still decide; a file list match is not proof.")
@@ -977,14 +1019,55 @@ def _window(args):
     return wininput.find_window(args.get("window"))
 
 
+PLAY_NET_MODES = {"standalone": 0, "listen_server": 1, "client": 2}      # EPlayNetMode: PIE_Standalone, PIE_ListenServer, PIE_Client
+
+
+def parse_play_settings(text):
+    """{net_mode, clients, separate_server, one_process} from the play settings object's text export."""
+    if not text:
+        return None
+    def field(name, default=None):
+        m = re.search(r"^\s*" + name + r"=(.*)$", text, re.M)
+        return m.group(1).strip() if m else default
+    return {"net_mode": field("PlayNetMode", "PIE_Standalone"), "clients": int(field("PlayNumberOfClients", "1") or 1),
+            "separate_server": field("bLaunchSeparateServer", "False") == "True", "one_process": field("RunUnderOneProcess", "True") == "True"}
+
+
+def lists_version():
+    """The game version the data/ file lists were made from, from their names (retail-1.5-files...)."""
+    names = sorted(p.name for p in DATA.glob("retail-*-files.json*"))
+    m = re.match(r"retail-([\d.]+)-files", names[-1]) if names else None
+    return m.group(1) if m else None
+
+
+def version_mismatch(editor_version, lists):
+    """A warning when the installed editor's major.minor isn't the one the file lists were made from, else None."""
+    if not editor_version or not lists:
+        return None
+    short = ".".join(editor_version.split(".")[:2])
+    if short == ".".join(lists.split(".")[:2]):
+        return None
+    return (f"The installed editor is {editor_version} and the file lists in data/ are from {lists}: the editor-only reference "
+            "check may be out of date (see data/make_editor_list.py).")
+
+
 def t_editor_status(args):
     node, nodes = REMOTE.find_node(wait=float(args.get("wait_seconds", 2)))
     report = {"remote_execution": node is not None, "file_bridge": bridge_alive(),
               "windows": [w["title"] for w in wininput.editor_windows()],
               "hook_installed": paths.hook_installed(),
-              "editor_install": str(EDITOR_ROOT) if EDITOR_ROOT else None}
+              "editor_install": str(EDITOR_ROOT) if EDITOR_ROOT else None,
+              "editor_version": paths.editor_version()}
+    note = version_mismatch(report["editor_version"], lists_version())
+    if note:
+        report["version_note"] = note
     if node is not None or report["file_bridge"]:
-        report.update(run_json(PY_STATUS, timeout=30))
+        (HERE / "exports").mkdir(exist_ok=True)
+        report.update(run_json(PY_STATUS, {"full": True, "settings_file": str(HERE / "exports" / "play_settings.t3d").replace("\\", "/")}, timeout=30))
+        report["pie_settings"] = parse_play_settings(report.pop("play_settings_text", None))
+        if report["pie_settings"]:
+            report["pie_settings"]["note"] = ("what the next Play In Editor uses. The editor saves these when Play starts, so a value set by "
+                                              "play_in_editor lasts for this session and persists across restarts once a Play has started with it.")
         if not report["open_mods"] and any("Mod Browser" in t for t in report["windows"]):
             report["hint"] = "The Mod Browser picker is open and no mod is loaded: use open_mod, or create one in the picker."
     elif not report["windows"]:
@@ -1002,15 +1085,85 @@ def t_launch_editor(args):
         return "Already running: " + ", ".join(w["title"] for w in wins)
     if EDITOR_EXE is None or not EDITOR_EXE.is_file():
         return NOT_FOUND, True
+    waited = time.time()
+    while wininput.editor_pids() and time.time() - waited < 90:   # no windows but a process: it is still exiting (or still starting)
+        time.sleep(1.0)
+    if wininput.editor_pids():
+        return ("An editor process is running with no window (exiting, or still starting): not launching a second one. "
+                "Wait, or end it, then try again."), True
     import subprocess
     cmd = [str(EDITOR_EXE)]
     subprocess.Popen(cmd,cwd=str(EDITOR_EXE.parent), creationflags=0x00000008 | 0x00000200)  # DETACHED, NEW_GROUP
     deadline = time.time() + float(args.get("wait_seconds", 180))
     while time.time() < deadline:
         time.sleep(2)
-        if bridge_alive() or REMOTE.find_node(wait=0.5)[0]:
+        if (bridge_alive() or REMOTE.find_node(wait=0.5)[0]) and wininput.editor_windows():
             return "Editor started and reachable. Windows: " + ", ".join(w["title"] for w in wininput.editor_windows())
     return "Editor started but not reachable yet (still loading, or the startup hook is not installed).", True
+
+
+def editor_process_running():
+    """Whether the editor's process exists, windows or not (it keeps running for a while after its windows close)."""
+    return bool(wininput.editor_pids())
+
+
+def close_editor(wait=180.0):
+    """Close the editor as the title bar's X would, after checking nothing is unsaved, and wait until its process is gone.
+    The crash box the editor often shows at the very end of exit is dismissed. Returns the report dict."""
+    wins = wininput.editor_windows()
+    if not wins and not editor_process_running():
+        return {"closed": False, "note": "The Mod Editor is not running."}
+    report = {"windows_before": [w["title"] for w in wins]}
+    try:
+        status = run_json(PY_STATUS, {"full": True, "settings_file": str(HERE / "exports" / "play_settings.t3d").replace("\\", "/")}, timeout=30)
+        dirty = status.get("dirty_packages") or {}
+        if dirty.get("content") or dirty.get("maps"):
+            report.update(closed=False, dirty_packages=dirty,
+                          error="Unsaved packages: save them (save_assets) or discard the changes in the editor first, so no Save Content dialog blocks the exit.")
+            return report
+        report["open_mods"] = [m["root"] for m in status.get("open_mods") or []]
+    except RemoteError as e:
+        report["note"] = f"couldn't ask the editor about unsaved packages ({str(e)[:120]}); closing anyway"
+    main = next((w for w in wins if "Unreal Editor" in w["title"] or "Mod Browser" in w["title"]), wins[0] if wins else None)
+    if main is not None:
+        wininput.close_main_window(main)
+    t0, deadline, dismissed = time.time(), time.time() + wait, []
+    while time.time() < deadline:
+        time.sleep(1.0)
+        now = wininput.editor_windows()
+        for w in now:
+            if "crash" in w["title"].lower():                     # the exit-time crash box: no data is lost, it just needs closing
+                wininput.close_window(w)
+                dismissed.append(w["title"])
+            elif "save content" in w["title"].lower() or "save" in w["title"].lower() and w is not main:
+                report.update(closed=False, dialog=w["title"], error="A save dialog is open: answer it in the editor, then call close_editor again.")
+                return report
+        if not now and not editor_process_running():
+            report.update(closed=True, seconds=round(time.time() - t0), dismissed=dismissed)
+            return report
+    report.update(closed=False, error=f"The editor is still running after {wait:.0f} s; windows: {[w['title'] for w in wininput.editor_windows()]}", dismissed=dismissed)
+    return report
+
+
+def t_close_editor(args):
+    r = close_editor(float(args.get("wait_seconds", 180)))
+    return json.dumps(r, indent=2), bool(r.get("error"))
+
+
+def t_restart_editor(args):
+    report = {"close": close_editor(float(args.get("wait_seconds", 180)))}
+    if report["close"].get("error"):
+        return json.dumps(report, indent=2), True
+    launched = t_launch_editor({"wait_seconds": args.get("launch_seconds", 300)})
+    report["launch"] = launched[0] if isinstance(launched, tuple) else launched
+    if isinstance(launched, tuple) and launched[1]:
+        return json.dumps(report, indent=2), True
+    if args.get("mod_file"):
+        opened = t_open_mod({"mod_file": args["mod_file"], "wait_seconds": args.get("open_seconds", 240)})
+        report["open"] = opened[0] if isinstance(opened, tuple) else opened
+        if isinstance(opened, tuple) and opened[1]:
+            return json.dumps(report, indent=2), True
+    return json.dumps(report, indent=2), False
 
 
 def t_open_mod(args):
@@ -1199,7 +1352,7 @@ def t_check_upload(args):
             return f"Mod root {args['mod_root']} is not open in the editor; pass mod_dir instead.", True
     if not d:
         return "Pass mod_dir (the project folder holding the .uplugin) or mod_root.", True
-    r = check_upload(d)
+    r = check_upload(d, args.get("ignore") or ())
     return json.dumps(r, indent=2), r["verdict"] == "FAIL"
 
 
@@ -2135,6 +2288,19 @@ def t_run_asset_audit(args):
     return json.dumps(report, indent=2), not lines or bool(report["errors"])
 
 
+def set_play_settings(net_mode=None, clients=None):
+    """Set the editor's PIE net mode ('standalone', 'listen_server', 'client' = a dedicated server plus the clients) and client
+    count, and read them back. Returns the report dict."""
+    if net_mode is not None and net_mode not in PLAY_NET_MODES:
+        raise RemoteError(f"net_mode must be one of {sorted(PLAY_NET_MODES)}")
+    (HERE / "exports").mkdir(exist_ok=True)
+    r = run_json(PY_SET_PLAY, {"net_mode": PLAY_NET_MODES[net_mode] if net_mode is not None else None, "clients": clients,
+                               "settings_file": str(HERE / "exports" / "play_settings.t3d").replace("\\", "/")}, timeout=30)
+    r["pie_settings"] = parse_play_settings(r.pop("play_settings_text", None))
+    r["note"] = "set for this editor session; the editor writes it to its ini when Play starts, and then it persists across restarts"
+    return r
+
+
 def t_play_in_editor(args):
     action = args.get("action", "start")
     if action == "stop":
@@ -2142,6 +2308,13 @@ def t_play_in_editor(args):
     status = run_json(PY_STATUS, timeout=30)
     if status.get("play_in_editor"):
         return "Already playing."
+    report = {}
+    if args.get("net_mode") is not None or args.get("clients") is not None:
+        report["settings"] = set_play_settings(args.get("net_mode"), args.get("clients"))
+    if action == "settings":
+        if not report:
+            report["settings"] = set_play_settings()
+        return json.dumps(report, indent=2)
     win = wininput.find_window()
     wininput.focus(win)
     wininput.keys("alt+p", 80)
@@ -2149,8 +2322,10 @@ def t_play_in_editor(args):
     while time.time() < deadline:
         time.sleep(1.5)
         if run_json(PY_STATUS, timeout=30).get("play_in_editor"):
-            return "Play In Editor started (Alt+P). Stop with play_in_editor(action='stop')."
-    return "Sent Alt+P but no game world appeared. Is a map loaded (not 'Empty')? Is a dialog or the Message Log in the way?", True
+            report["started"] = "Play In Editor started (Alt+P). Stop with play_in_editor(action='stop')."
+            return json.dumps(report, indent=2)
+    report["error"] = "Sent Alt+P but no game world appeared. Is a map loaded (not 'Empty')? Is a dialog or the Message Log in the way?"
+    return json.dumps(report, indent=2), True
 
 
 def export_mod_t3d(path):
@@ -2296,11 +2471,20 @@ XY = {"x": NUM, "y": NUM, "window_pixels": {"type": "boolean", "description": "x
 
 TOOLS = [
     ("editor_status", t_editor_status,
-     "Call first. Whether the Mod Editor is running and reachable (remote execution / file bridge), which mod is open, the map, and whether Play In Editor is running.",
+     "Call first. Whether the Mod Editor is running and reachable (remote execution / file bridge), which mod is open, the map, whether Play In Editor "
+     "is running, the unsaved (dirty) packages, the Play In Editor settings the next session will use (net mode, client count: they persist across "
+     "restarts), the editor's version and whether the file lists in data/ match it.",
      S(wait_seconds=NUM), []),
     ("launch_editor", t_launch_editor,
      "Start the Mod Editor and wait until it is reachable. It opens on the Mod Browser picker; then use open_mod.",
      S(wait_seconds=NUM), []),
+    ("close_editor", t_close_editor,
+     "Close the Mod Editor the way its title bar's X does, after checking nothing is unsaved (unsaved packages are an error: save or discard first), "
+     "and wait until its process is gone; the crash box it often shows at the very end of exit is dismissed. Switching mods needs this: the picker only shows at start.",
+     S(wait_seconds=NUM), []),
+    ("restart_editor", t_restart_editor,
+     "close_editor, then launch_editor, then open_mod(mod_file) when given: the way to switch to another mod, or to test that rows and Blueprints really "
+     "saved to disk (a fresh editor reads only what's on disk).", S(mod_file=STR, wait_seconds=NUM, launch_seconds=NUM, open_seconds=NUM), []),
     ("open_mod", t_open_mod,
      "Open a mod project (.abfmod file or its folder) from the Mod Browser picker via Browse... "
      "(the command line can't open one). Works only while the picker is showing.",
@@ -2350,8 +2534,9 @@ TOOLS = [
      S(file=STR, text=STR, node_prefix=STR), []),
     ("check_upload", t_check_upload,
      "Offline pre-upload check of a mod project folder (Upload zips the WHOLE folder): .md files (mod.io error 29200), dev files that would ship, "
-     "/Game references that exist only in the editor (cloud cook fails), .uplugin version. Give mod_dir, or mod_root of an open mod.",
-     S(mod_dir=STR, mod_root=STR), []),
+     "/Game references that exist only in the editor (cloud cook fails), .uplugin version. Give mod_dir, or mod_root of an open mod. "
+     "ignore: package paths (or parts) whose references are known to be fine, listed as ignored instead of failing the check.",
+     S(mod_dir=STR, mod_root=STR, ignore={"type": "array", "items": STR}), []),
     ("editor_windows", t_editor_windows,
      "List the Mod Editor's open windows (main editor, asset editors, Mod Browser, PIE, dialogs). include_popups adds its untitled popup "
      "windows (an open menu, tooltips) as '<popup N>', topmost first.", S(include_popups=BOOL), []),
@@ -2435,8 +2620,11 @@ TOOLS = [
      "default 6) or timeout_seconds (900). Closes the Message Log it opens unless close_message_log=false. The main window must be about "
      "1150 px wide or more.", S(timeout_seconds=NUM, quiet_seconds=NUM, close_message_log=BOOL), []),
     ("play_in_editor", t_play_in_editor,
-     "Start (Alt+P in the main window) or stop Play In Editor. Load a real map first (e.g. /Game/Maps/Facility); close the Message Log first.",
-     S(action={"type": "string", "enum": ["start", "stop"]}, wait_seconds=NUM), []),
+     "Start (Alt+P in the main window) or stop Play In Editor. Load a real map first (e.g. /Game/Maps/Facility); close the Message Log first. "
+     "net_mode (standalone, listen_server, client = a dedicated server plus the clients) and clients set the editor's Play settings before starting; "
+     "they persist across restarts, so editor_status shows them. action='settings' only sets or reads them.",
+     S(action={"type": "string", "enum": ["start", "stop", "settings"]}, net_mode={"type": "string", "enum": ["standalone", "listen_server", "client"]},
+       clients=INT, wait_seconds=NUM), []),
     ("get_game_row", t_get_game_row,
      "Read a base-game row as export text by kind + name (kind = snake_case of the game's <Kind>HandleFunctionLibrary: "
      "global_item, gear_item, weapon_item, craftable_item, deployable_item, pickup_item, food_and_gibs_item, pet_item, plant_item, "
@@ -2477,6 +2665,10 @@ TOOLS = [
      S(lines=INT, contains={"type": "string", "description": "Case-insensitive regex."}, since_minutes=NUM, max_scan_mb=NUM, file=STR), []),
 ]
 TOOL_MAP = {t[0]: t for t in TOOLS}
+# Tools that change nothing in the editor or the mod (an export file under exports/ doesn't count), for clients that auto-allow those.
+READ_ONLY_TOOLS = {"editor_status", "list_mods", "list_mod_templates", "find_assets", "get_row", "get_game_row", "editor_windows",
+                   "editor_screenshot", "inspect_blueprint", "export_t3d", "t3d_errors", "blueprint_filter_check", "check_upload",
+                   "read_editor_log", "pie_info"}
 
 INSTRUCTIONS = (
     "Tools for the official Abiotic Factor Mod Editor (custom Unreal 5.4.4 cooked editor, Python 3.11). Start with editor_status. "
@@ -2510,8 +2702,8 @@ def handle(req):
     if method == "ping":
         return {}
     if method == "tools/list":
-        return {"tools": [{"name": n, "description": d,
-                           "inputSchema": {"type": "object", "properties": p, "required": r}}
+        return {"tools": [dict({"name": n, "description": d, "inputSchema": {"type": "object", "properties": p, "required": r}},
+                               **({"annotations": {"readOnlyHint": True}} if n in READ_ONLY_TOOLS else {}))
                           for n, _, d, p, r in TOOLS]}
     if method == "tools/call":
         tool = TOOL_MAP.get(params.get("name"))

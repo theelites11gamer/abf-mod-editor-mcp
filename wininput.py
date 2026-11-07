@@ -43,6 +43,11 @@ gdi32.DeleteDC.argtypes = [wt.HDC]
 gdi32.BitBlt.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.HDC, ctypes.c_int, ctypes.c_int, wt.DWORD]
 gdi32.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, wt.UINT, wt.UINT, ctypes.c_void_p, ctypes.c_void_p, wt.UINT]
 kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+kernel32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
 kernel32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
 kernel32.GlobalAlloc.restype = ctypes.c_void_p
 kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
@@ -67,6 +72,33 @@ def _exe_of(pid):
         return ""
     finally:
         kernel32.CloseHandle(h)
+
+
+class _PROCESSENTRY32(ctypes.Structure):
+    _fields_ = [("dwSize", wt.DWORD), ("cntUsage", wt.DWORD), ("th32ProcessID", wt.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", wt.DWORD), ("cntThreads", wt.DWORD), ("th32ParentProcessID", wt.DWORD), ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wt.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+def editor_pids():
+    """Process ids of the Mod Editor, windows or not (it keeps running for a while after its windows close). A process
+    snapshot, because tasklist shows nothing from some sandboxes."""
+    snap = kernel32.CreateToolhelp32Snapshot(0x2, 0)                 # TH32CS_SNAPPROCESS
+    if snap in (None, -1, 0xFFFFFFFFFFFFFFFF):
+        return []
+    entry = _PROCESSENTRY32()
+    entry.dwSize = ctypes.sizeof(_PROCESSENTRY32)
+    found = []
+    try:
+        if kernel32.Process32FirstW(snap, ctypes.byref(entry)):
+            while True:
+                if entry.szExeFile.lower().startswith(EDITOR_EXE.lower()):
+                    found.append(int(entry.th32ProcessID))
+                if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snap)
+    return found
 
 
 def _rect(h):
@@ -365,6 +397,12 @@ def close_window(win):
     if "Unreal Editor" in win["title"]:
         raise WinError("Refusing to close the main editor window; use the editor's own quit.")
     user32.PostMessageW(win["hwnd"], 0x0010, 0, 0)       # WM_CLOSE
+    time.sleep(0.5)
+
+
+def close_main_window(win):
+    """Ask the main editor window to close (WM_CLOSE), the way the title bar's X does. Only close_editor uses this."""
+    user32.PostMessageW(win["hwnd"], 0x0010, 0, 0)
     time.sleep(0.5)
 
 

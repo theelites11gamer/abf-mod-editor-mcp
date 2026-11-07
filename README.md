@@ -39,19 +39,19 @@ The editor's Python plugin has a "remote execution" mode (UDP discovery on 239.0
 
 The server uses remote execution first and the bridge second, opens a fresh connection per command (so it can share the editor with other tools), and reports a command that was sent but got no reply instead of retrying it.
 
-## Tools (42)
+## Tools (44)
 
 | Group | Tools |
 | --- | --- |
-| Status and launch | `editor_status` (call first), `launch_editor`, `open_mod` (drives the picker's Browse… dialog, since the command line can't open a mod) |
+| Status and launch | `editor_status` (call first: reachability, open mod, map, unsaved packages, the Play In Editor settings the next session will use, editor version), `launch_editor`, `open_mod` (drives the picker's Browse… dialog, since the command line can't open a mod), `close_editor` (after checking nothing is unsaved; dismisses the exit-time crash box), `restart_editor` (close, launch, open a mod: the way to switch mods, or to check what really saved to disk) |
 | Python | `run_python`, `evaluate_python`, `run_python_file` (`args` → `ARGS` inside the script) |
 | Mod data | `list_mods`, `list_mod_templates`, `find_assets`, `get_row`, `set_row` (plain values, Python expressions, or whole export text), `create_row_asset` (any of the 72 `*ModRowAsset` classes, optionally copied from a base-game row or another mod row), `delete_asset`, `save_assets`, `validate_assets` |
 | Base-game data | `get_game_row` — list or read any row the game exposes through its `<Kind>HandleFunctionLibrary` (gear_item, weapon_item, recipe, buff_debuff, npc, pet, trait, …) |
 | Blueprints | `build_graph` (node list → graph, every pin checked against the editor; `merge` links new nodes to a graph's existing ones), `discover_pins` (the real pins of any node), `paste_graph` (clipboard T3D → graph, then checks what arrived), `compile_blueprint` (reports the compiler's errors; a Blueprint with errors isn't saved), `inspect_blueprint` (parent, variables, graphs, every reference, errors, nodes and pins), `export_t3d`, `t3d_errors`, `blueprint_filter_check` |
 | Window | `open_asset`, `close_asset`, `editor_windows` (with the open menu and other popups on request), `editor_screenshot` (one editor window, returned as an image, works in the background), `editor_click`, `editor_keys`, `editor_menu` (open a context menu or dropdown and get its picture), `editor_drag` (wire a pin to a pin), `close_editor_window` |
-| Map and play | `load_map`, `play_in_editor` start/stop, `pie_info` (players, pawns, locations, chosen pawn properties), `console_command` (editor or game world) |
+| Map and play | `load_map`, `play_in_editor` start/stop, with a net mode (standalone, listen server, or a dedicated server plus clients) and client count, `pie_info` (players, pawns, locations, chosen pawn properties), `console_command` (editor or game world) |
 | Menus | `add_variable` (a Blueprint member variable, through the Set node's context menu), `override_function` (a parent function or event, through the Override menu), `run_asset_audit` (the editor's own Asset Audit, from the toolbar's flask menu) |
-| Release | `check_upload` (offline pre-upload check), `read_editor_log` |
+| Release | `check_upload` (offline pre-upload check, with an ignore list for references known to be fine), `read_editor_log` |
 
 ### Safety rails built in
 
@@ -139,6 +139,8 @@ These depend on the default window layout at 100% scaling (scaled by the monitor
 - A new mod project can't be created from Python (the template system has no entry point). Do it in the picker: ITEMS tile → template → name → Create. `editor_screenshot` + `editor_click`/`editor_keys` can drive it.
 - Loading a map opens the Message Log over the viewport; `close_editor_window("Message Log")` before Play In Editor.
 - The editor runs commands on its game thread: keep scripts short, and never open a modal dialog from one.
+- The Play In Editor settings (net mode, number of clients) are the editor's own: the editor saves them when Play starts, and they persist across restarts, so a dedicated-server test leaves the next session set up that way. `editor_status` shows them and `play_in_editor` sets them; a value set that way lasts for the session, and persists once a Play has started with it. The net mode is read from a text export of the settings object, since Python can't convert that enum.
+- `close_editor` refuses while packages are unsaved, so no Save Content dialog can block the exit; the editor often shows a crash box at the very end of exiting (no data is lost), which it dismisses, then waits for the process to be gone (a process snapshot, not `tasklist`, which shows nothing from some sandboxes) before `restart_editor` launches again, so two editors never overlap. On this machine a restart to the picker takes about ten seconds.
 - Menus (a node's context menu, a toolbar dropdown, the Override list) are untitled popup windows of the editor's own, and they close the moment another window is focused. `editor_menu` opens one and returns its picture; `editor_windows` lists them with `include_popups`; `editor_click` with `window='popup'` (image pixels of that picture) or `keep_menu=true`, and `editor_keys` with `keep_menu=true`, act without focusing first. Escape closes a menu.
 - A float pin is `real` with sub-category `double` in this engine. A custom event parameter or an `element` with cat `real` (or `float`, `double`) is written that way; written as `real` alone, it compiled as the wrong type ("Array of Floats").
 - An `event` of a class the Blueprint's parent doesn't descend from is refused before anything is pasted: the editor would turn it into a custom event with no parameters. Earlier versions cached that result and served it to later builds; such entries are dropped from `data/node-templates.json` now, and a probe whose node came back as a different class is reported as an error and never kept.
@@ -153,7 +155,7 @@ These depend on the default window layout at 100% scaling (scaled by the monitor
 
 ## Limits
 
-- Built against Mod Editor 1.5.0 (engine `5.4.4-1050002+++DF+ABF`, Python 3.11). A future editor update may change the Python API; the file lists in `data/` are versioned and will need regenerating after a game update.
+- Built against Mod Editor 1.5.0 (engine `5.4.4-1050002+++DF+ABF`, Python 3.11). A future editor update may change the Python API; the file lists in `data/` are versioned and will need regenerating after a game update (`editor_status` and `check_upload` warn when the installed editor's version no longer matches them).
 - Windows only.
 - Bringing the graph forward clicks positions in the default window layout, tested at 100% Windows display scaling. If they miss, `paste_graph` says nothing arrived, and a click on the tab from `editor_click` does the same job.
 - A mod made with these tools still has to pass the editor's Asset Audit and mod.io's cloud cook; the checkers here reduce surprises, they don't guarantee anything.

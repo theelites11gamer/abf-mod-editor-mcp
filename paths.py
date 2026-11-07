@@ -98,6 +98,19 @@ def find_editor_root(explain=False):
     return (None, tried) if explain else None
 
 
+def editor_version():
+    """The Mod Editor's version as the Epic Games Launcher manifest records it (e.g. '1.5.0.31876'), or None."""
+    manifests = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "Epic" / "EpicGamesLauncher" / "Data" / "Manifests"
+    for item in sorted(manifests.glob("*.item")) if manifests.is_dir() else []:
+        try:
+            m = json.loads(item.read_text(encoding="utf-8-sig"))
+        except (ValueError, OSError):
+            continue
+        if m.get("DisplayName") == EDITOR_DISPLAY_NAME and m.get("AppVersionString"):
+            return str(m["AppVersionString"])
+    return None
+
+
 def editor_exe(root=None):
     root = root or find_editor_root()
     return (root / EDITOR_EXE_REL) if root else None

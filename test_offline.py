@@ -687,6 +687,46 @@ class Menus(unittest.TestCase):
         self.assertEqual((m.group(1), m.group(2), m.group(3)), ("2", "1", "123.321ms"))
 
 
+class QuickBatch(unittest.TestCase):
+    def test_play_settings_text(self):
+        import server
+        text = "Begin Object Class=/Script/UnrealEd.LevelEditorPlaySettings Name=\"Default__LevelEditorPlaySettings\"\n   bLaunchSeparateServer=False\n   PlayNetMode=PIE_Client\n   RunUnderOneProcess=True\n   PlayNumberOfClients=2\nEnd Object\n"
+        self.assertEqual(server.parse_play_settings(text), {"net_mode": "PIE_Client", "clients": 2, "separate_server": False, "one_process": True})
+        self.assertEqual(server.parse_play_settings("x")["net_mode"], "PIE_Standalone")
+        self.assertIsNone(server.parse_play_settings(None))
+        self.assertEqual(server.PLAY_NET_MODES, {"standalone": 0, "listen_server": 1, "client": 2})
+
+    def test_version_mismatch(self):
+        import server
+        self.assertEqual(server.lists_version(), "1.5")
+        self.assertIsNone(server.version_mismatch("1.5.0.31876", "1.5"))
+        self.assertIn("1.6.0.1", server.version_mismatch("1.6.0.1", "1.5"))
+        self.assertIsNone(server.version_mismatch(None, "1.5"))
+
+    def test_check_upload_ignore(self):
+        import server
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "Mine.uplugin").write_text(json.dumps({"FriendlyName": "Mine", "VersionName": "1.0"}), encoding="utf-8")
+            (root / "Content").mkdir()
+            (root / "Content" / "BP_Thing.uasset").write_bytes(b"\x00/Game/Nowhere/NotAPackage\x00/Game/Blueprints/Characters/Abiotic_PlayerCharacter\x00")
+            plain = server.check_upload(root)
+            self.assertTrue(any("Nowhere" in w for w in plain["warnings"]), plain)
+            self.assertFalse(any("Abiotic_PlayerCharacter" in w for w in plain["warnings"] + plain["errors"]), plain)
+            quiet = server.check_upload(root, ["/Game/Nowhere/"])
+            self.assertFalse(any("Nowhere" in w for w in quiet["warnings"]), quiet)
+            self.assertTrue(any("Nowhere" in w for w in quiet["ignored"]), quiet)
+
+    def test_read_only_annotations(self):
+        import server
+        tools = {t["name"]: t for t in server.handle({"method": "tools/list", "params": {}})["tools"]}
+        self.assertTrue(tools["editor_status"]["annotations"]["readOnlyHint"])
+        self.assertNotIn("annotations", tools["set_row"])
+        self.assertNotIn("annotations", tools["build_graph"])
+        self.assertIn("close_editor", tools)
+        self.assertIn("restart_editor", tools)
+
+
 class Templates(unittest.TestCase):
     """server.py's template bookkeeping, with the editor faked out."""
 
