@@ -77,7 +77,7 @@ Python can't create Blueprint nodes in this editor, so nodes go in as clipboard 
   "asset_path": "/MyMod/Blueprints/BP_MyActor",
   "nodes": [
     {"id": "begin", "type": "event", "owner": "/Script/Engine.Actor", "function": "ReceiveBeginPlay"},
-    {"id": "say", "owner": "/Script/Engine.KismetSystemLibrary", "function": "PrintString", "args": {"InString": "Hello"}}
+    {"id": "say", "owner": "/Script/AbioticFactor.AbioticFunctionLibrary", "function": "AbioticLog", "args": {"LogMessage": "Hello"}}
   ],
   "links": [["begin.then", "say.execute"]],
   "paste": true,
@@ -85,9 +85,11 @@ Python can't create Blueprint nodes in this editor, so nodes go in as clipboard 
 }
 ```
 
+`AbioticLog` writes to the game's log. `PrintString` is compiled out of this Test editor and of the game, so it shows nothing.
+
 It never guesses a pin. Each kind of node is first pasted bare into a throwaway Blueprint outside your mod, which is never saved and is deleted straight away, and the pins the editor allocates are the ones used. Answers about game and engine classes are kept in `data/node-templates.json`, so the next request for the same node is instant. A wrong pin name is an error that lists the real ones. After pasting it reads the Blueprint back and reports any node or link that didn't arrive.
 
-The result also lists anything the upload filter would block. For nodes `build_graph` has no type for, `raw` takes a node class and properties. `paste_graph` does the same pasting and checking for T3D you already have.
+The result also lists anything the upload filter would block. For nodes `build_graph` has no type for, `raw` takes a node class and properties, as `Key=Value` lines or an object whose values are written as given (so a string property keeps its quotes). `paste_graph` does the same pasting and checking for T3D you already have.
 
 ## Working notes
 
@@ -106,6 +108,12 @@ The result also lists anything the upload filter would block. For nodes `build_g
 - A new mod project can't be created from Python (the template system has no entry point). Do it in the picker: ITEMS tile → template → name → Create. `editor_screenshot` + `editor_click`/`editor_keys` can drive it.
 - Loading a map opens the Message Log over the viewport; `close_editor_window("Message Log")` before Play In Editor.
 - The editor runs commands on its game thread: keep scripts short, and never open a modal dialog from one.
+- A float pin is `real` with sub-category `double` in this engine. A custom event parameter or an `element` with cat `real` (or `float`, `double`) is written that way; written as `real` alone, it compiled as the wrong type ("Array of Floats").
+- An `event` of a class the Blueprint's parent doesn't descend from is refused before anything is pasted: the editor would turn it into a custom event with no parameters. Earlier versions cached that result and served it to later builds; such entries are dropped from `data/node-templates.json` now, and a probe whose node came back as a different class is reported as an error and never kept.
+- Probes (`build_graph`, `discover_pins`) don't run while Play In Editor is running: the throwaway Blueprint's window can't take the paste then.
+- The throwaway Blueprint's asset-registry entry can outlive its object under `/Engine/Transient`; each probe sweeps stale `BP_McpProbe*` entries, so they don't pile up.
+- A paste goes to the graph tab that is showing. On a function's tab the editor drops event nodes; the report names them and says to bring the Event Graph forward.
+- `compile_blueprint` takes the compiler's lines for that asset by the file name in the log, so a Blueprint whose name contains another's (BP_Door, BP_DoorFrame) no longer collects the other's messages.
 
 ## Testing
 

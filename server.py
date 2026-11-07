@@ -35,7 +35,7 @@ import graphbuild  # noqa: E402
 import paths     # noqa: E402
 
 SERVER_NAME = "abiotic-mod-editor"
-SERVER_VERSION = "2.3.2"
+SERVER_VERSION = "2.3.3"
 
 EDITOR_ROOT = paths.find_editor_root()          # None when no Mod Editor install was found
 EDITOR_EXE = paths.editor_exe(EDITOR_ROOT)
@@ -734,9 +734,10 @@ def _abf(args):
     return {"asked": len(args["classes"])}
 '''
 
-# A throwaway Blueprint: never saved and outside the mod, so it can't ship. /Temp is refused as an asset path here.
-PY_PROBE_CREATE = r'''
-def _abf(args):
+# The probe's parent class: the named Blueprint's class, else the named class, else Actor. The event check resolves it
+# the same way, so the two agree.
+PY_PARENT = r'''
+def _parent(args):
     parent = None
     if args.get("parent_asset"):
         bp = unreal.load_asset(args["parent_asset"])
@@ -744,8 +745,51 @@ def _abf(args):
             parent = unreal.BlueprintEditorLibrary.generated_class(bp)
     if parent is None and args.get("parent_class"):
         parent = unreal.load_class(None, args["parent_class"])
-    if parent is None:
-        parent = unreal.Actor.static_class()
+    return parent if parent is not None else unreal.Actor.static_class()
+'''
+
+# An event of a class the parent doesn't descend from is pasted as a custom event with no parameters, so ask first.
+PY_EVENT_CHECK = PY_PARENT + r'''
+def _abf(args):
+    parent = _parent(args)
+    out = {"parent": parent.get_path_name(), "events": {}}
+    for e in args["events"]:
+        info = {}
+        try:
+            owner = unreal.load_class(None, e["owner"])
+            info["owner_found"] = owner is not None
+            if owner is not None:
+                info["interface"] = bool(unreal.MathLibrary.class_is_child_of(owner, unreal.Interface.static_class()))
+                info["is_ancestor"] = bool(unreal.MathLibrary.class_is_child_of(parent, owner))
+        except Exception as ex:
+            info["error"] = str(ex)[:200]
+        out["events"][e["id"]] = info
+    return out
+'''
+
+PY_PIE_RUNNING = r'''
+def _abf(args):
+    return {"playing": unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world() is not None}
+'''
+
+# delete_asset can leave the asset-registry entry of a transient asset behind once its object is gone; it then shows in
+# list_assets and the probes pile up. A second delete clears it, so both probe steps sweep the stale ones.
+PY_SWEEP = r'''
+def _sweep():
+    lib = unreal.EditorAssetLibrary
+    swept = []
+    for path in [str(x).split(".")[0] for x in lib.list_assets("/Engine/Transient", recursive=True, include_folder=False)]:
+        name = path.rsplit("/", 1)[-1]
+        if name.startswith("BP_McpProbe") and unreal.find_object(None, path + "." + name) is None and len(swept) < 8:
+            swept.append([path, bool(lib.delete_asset(path))])
+    return swept
+'''
+
+# A throwaway Blueprint: never saved and outside the mod, so it can't ship. /Temp is refused as an asset path here.
+PY_PROBE_CREATE = PY_PARENT + PY_SWEEP + r'''
+def _abf(args):
+    swept = _sweep()
+    parent = _parent(args)
     tools = unreal.AssetToolsHelpers.get_asset_tools()
     widget = unreal.MathLibrary.class_is_child_of(parent, unreal.UserWidget.static_class())
     factory = unreal.WidgetBlueprintFactory() if widget else unreal.BlueprintFactory()
@@ -754,16 +798,17 @@ def _abf(args):
     if asset is None:
         return {"error": "could not create a probe Blueprint with parent " + parent.get_path_name()}
     unreal.get_editor_subsystem(unreal.AssetEditorSubsystem).open_editor_for_assets([asset])
-    return {"asset": asset.get_outermost().get_name(), "parent": parent.get_path_name(), "widget": widget}
+    return {"asset": asset.get_outermost().get_name(), "parent": parent.get_path_name(), "widget": widget, "swept": swept}
 '''
 
-PY_PROBE_REMOVE = r'''
+PY_PROBE_REMOVE = PY_SWEEP + r'''
 def _abf(args):
     asset = unreal.load_asset(args["asset_path"])
-    if asset is None:
-        return {"removed": False}
-    unreal.get_editor_subsystem(unreal.AssetEditorSubsystem).close_all_editors_for_asset(asset)
-    return {"removed": bool(unreal.EditorAssetLibrary.delete_asset(args["asset_path"]))}
+    removed = False
+    if asset is not None:
+        unreal.get_editor_subsystem(unreal.AssetEditorSubsystem).close_all_editors_for_asset(asset)
+        removed = bool(unreal.EditorAssetLibrary.delete_asset(args["asset_path"]))
+    return {"removed": removed, "swept": _sweep()}
 '''
 
 
@@ -1102,9 +1147,9 @@ def compile_blueprint(path, save=True, save_on_error=False):
     name = path.rsplit("/", 1)[-1]
     errors, warnings = [], []
     for line in log_since(mark):
-        if "[Compiler]" in line and name in line:
-            text = line.split("[Compiler]", 1)[1].strip()
-            (errors if "Error:" in line.split("[Compiler]", 1)[0] else warnings).append(text)
+        msg = bpscan.compiler_message(line, name)        # this asset's lines only, by the file name in the log
+        if msg:
+            (errors if msg[1] == "error" else warnings).append(msg[2])
     r.update(ok=not errors, errors=errors, warnings=warnings)
     if save and (r["ok"] or save_on_error):
         r["saved"] = bool(run_json(PY_SAVE, {"asset_paths": [path]}).get(path))
@@ -1349,6 +1394,9 @@ def paste_checked(text, asset=None, win=None, xy=None, clear=False, settle=3.0, 
     if reused and not clear:
         report["note"] = (f"{len(reused)} node names were already in the Blueprint, so the editor renamed the new copies and they read as "
                           "missing. Use a new node-name prefix for each paste (build_graph does).")
+    hint = graphbuild.dropped_event_hint(text, result)
+    if hint:
+        report["hint"] = hint
     if not result["nodes_found"]:
         report["hint"] = NOTHING_ARRIVED
     is_error = not result["ok"]
@@ -1404,7 +1452,9 @@ def load_templates():
     try:
         saved = json.loads(TEMPLATES.read_text(encoding="utf-8"))
         if saved.get("build") == build:
-            return saved["nodes"]
+            # Versions before 2.3.3 kept what a wrong parent turned an event into (a custom event with no parameters)
+            # and nodes the editor flagged; neither is worth building from.
+            return {k: v for k, v in saved["nodes"].items() if graphbuild.usable_template(v) and v.get("class") != "K2Node_CustomEvent"}
     except (OSError, ValueError, KeyError):
         pass
     return {}
@@ -1417,6 +1467,9 @@ def save_templates(nodes):
 
 def probe_nodes(nodes, parent_asset=None, parent_class=None):
     """Paste nodes bare into a throwaway Blueprint and read back what the editor allocated: {template key: template}."""
+    if run_json(PY_PIE_RUNNING, timeout=30).get("playing"):
+        raise RemoteError("Play In Editor is running, and the throwaway Blueprint's window can't take a paste while it does. "
+                          "Stop it with play_in_editor(action='stop'), then try again.")
     run = "McpProbe" + uuid.uuid4().hex[:8]
     items, keys = [], {}
     for n in nodes:
@@ -1451,24 +1504,61 @@ def probe_nodes(nodes, parent_asset=None, parent_class=None):
             raise RemoteError("Couldn't paste into the throwaway Blueprint's Event Graph: its window may not use the default layout. "
                               "Reset it with Window > Load Layout > Default Editor Layout, or pass full pins with type 'raw'.")
         found = graphbuild.templates_from_export(export, [name for name, _ in items])
+        for name, n in items:
+            # The editor pasted something else: an event the parent doesn't have comes back as a custom event with no
+            # parameters. Those pins are the wrong node's, so this is an error, and templates_for never keeps it.
+            tpl, want = found.get(name), graphbuild.node_class(n)
+            if tpl and tpl["class"] != want:
+                why = ("that class has no event by this name; pass the asset_path or parent_class of a Blueprint whose parent has it"
+                       if want == "K2Node_Event" else "the node as specified isn't valid there")
+                found[name] = {"class": tpl["class"], "props": [], "pins": [],
+                               "error": f"the editor turned this {want} into a {tpl['class']} when pasted under parent {info['parent']}: {why}."}
     finally:
         if removable:
             run_json(PY_PROBE_REMOVE, {"asset_path": info["asset"]}, timeout=60, remote_only=True)
     return {key: found.get(name) for key, name in keys.items()}
 
 
+def event_check(nodes, parent_asset=None, parent_class=None):
+    """{node id: error template} for `event` nodes whose owner the parent class doesn't descend from. The editor pastes
+    such an event as a custom event with no parameters; a template of that once got cached and served to every later build.
+    Interface events are left to the probe, and an unreachable editor skips the check (the probe will say so)."""
+    events = [n for n in nodes if n.get("type") == "event" and n.get("owner")]
+    if not events:
+        return {}
+    try:
+        r = run_json(PY_EVENT_CHECK, {"parent_asset": parent_asset, "parent_class": parent_class,
+                                      "events": [{"id": n["id"], "owner": n["owner"]} for n in events]}, timeout=60)
+    except RemoteError:
+        return {}
+    out = {}
+    for n in events:
+        info = r.get("events", {}).get(n["id"]) or {}
+        if info.get("owner_found") and not info.get("interface") and info.get("is_ancestor") is False:
+            out[n["id"]] = {"class": "K2Node_Event", "props": [], "pins": [], "error": (
+                f"event {n['function']} belongs to {n['owner']}, and the Blueprint's parent {r.get('parent')} doesn't descend from it, "
+                "so the editor would paste it as a custom event with no parameters. Pass the asset_path or parent_class of a "
+                "Blueprint whose parent has this event.")}
+    return out
+
+
 def templates_for(nodes, parent_asset=None, parent_class=None):
-    """({node id: template}, how many nodes needed the editor)."""
+    """({node id: template}, how many nodes needed the editor). A template with an error is returned, so the caller can
+    say what's wrong, but never kept for later."""
     saved = load_templates()
-    need = [n for n in nodes if not (graphbuild.is_stable(n) and graphbuild.template_key(n) in saved)]
+    refused = event_check(nodes, parent_asset, parent_class)
+    need = [n for n in nodes if n["id"] not in refused and not (graphbuild.is_stable(n) and graphbuild.template_key(n) in saved)]
     fresh = probe_nodes(need, parent_asset, parent_class) if need else {}
-    if any(graphbuild.is_stable(n) and fresh.get(graphbuild.template_key(n)) for n in need):
-        for n in need:
-            key = graphbuild.template_key(n)
-            if graphbuild.is_stable(n) and fresh.get(key):
-                saved[key] = fresh[key]
+    keep = {graphbuild.template_key(n): fresh[graphbuild.template_key(n)] for n in need
+            if graphbuild.is_stable(n) and graphbuild.usable_template(fresh.get(graphbuild.template_key(n)))}
+    if keep:
+        saved.update(keep)
         save_templates(saved)
-    return {n["id"]: fresh.get(graphbuild.template_key(n)) or saved.get(graphbuild.template_key(n)) for n in nodes}, len(need)
+    out = {}
+    for n in nodes:
+        key = graphbuild.template_key(n)
+        out[n["id"]] = refused.get(n["id"]) or fresh.get(key) or saved.get(key)
+    return out, len(need)
 
 
 def named_nodes(nodes, asset=None):
@@ -1803,7 +1893,8 @@ TOOLS = [
     ("discover_pins", t_discover_pins,
      "The real pins of Blueprint nodes (name, direction, type, class, default), read from the editor: nodes are pasted into a throwaway "
      "Blueprint that is never saved and is deleted afterwards. Nodes use build_graph's format, e.g. {owner:'/Script/Engine.KismetSystemLibrary', function:'PrintString'}. "
-     "Give asset_path to resolve that Blueprint's own functions and variables. Takes focus for a few seconds unless every answer is cached.",
+     "Give asset_path to resolve that Blueprint's own functions and variables. Takes focus for a few seconds unless every answer is cached. "
+     "Not while Play In Editor runs.",
      S(nodes={"type": "array", "items": OBJ}, asset_path=STR, parent_class=STR), ["nodes"]),
     ("build_graph", t_build_graph,
      "Build Blueprint nodes from a list, no T3D writing needed. Every pin name is checked against the pins the editor really allocates, "
@@ -1811,9 +1902,9 @@ TOOLS = [
      "it also pastes and verifies; compile=true compiles a clean paste. Paste custom events and compile before pasting callers.\n"
      "nodes: [{id, type, x?, y?, args?: {pin: literal default}, element?: {cat, obj?} for wildcard pins}]. Types and their fields: "
      "call {owner?, function} (no owner = this Blueprint's own); array_call {function}; call_parent {owner, function}; event {owner, function}; "
-     "custom_event {name, params?: [{name, cat, obj?, array?}], rpc?: server|client|multicast, reliable?}; var_get / var_set {name, owner?}; cast {target}; branch; "
+     "custom_event {name, params?: [{name, cat (a float is cat real), obj?, array?}], rpc?: server|client|multicast, reliable?}; var_get / var_set {name, owner?}; cast {target}; branch; "
      "sequence {outputs?}; self; make_array {count, element}; make_struct / break_struct {struct}; foreach {element}; input_action {name, consume?}; "
-     "spawn_actor / add_component {class}; create_delegate {function}; comment {text, width?, height?}; raw {kind, props?, pins?}.\n"
+     "spawn_actor / add_component {class}; create_delegate {function}; comment {text, width?, height?}; raw {kind, props? (['Key=Value'] lines or {Key: Value}, values written as given), pins?}.\n"
      "links: [['a.then', 'b.execute'], ['c.ReturnValue', 'd.InString']]. Exec pins are usually execute/then; see discover_pins. "
      "Links can't reach nodes already in the graph. spec_file: JSON file with nodes and links, for big graphs.",
      S(nodes={"type": "array", "items": OBJ}, links={"type": "array", "items": {"type": "array", "items": STR}}, spec_file=STR, asset_path=STR,

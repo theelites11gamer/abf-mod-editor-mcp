@@ -4,6 +4,7 @@
 """
 
 import codecs
+import json
 import sys
 import tempfile
 import unittest
@@ -571,6 +572,133 @@ class Builder(unittest.TestCase):
         self.assertEqual(set(t), {"A_0"})
         self.assertEqual(len(t["A_0"]["pins"]), 1)
         self.assertTrue(t["A_0"]["props"][0].startswith("EventReference="))
+
+    def test_float_params_are_doubles(self):
+        props = graphbuild.describe({"id": "x", "type": "custom_event", "name": "Go",
+                                     "params": [{"name": "Amount", "cat": "float"}, {"name": "N", "cat": "int"}]})[1]
+        self.assertIn('PinType=(PinCategory="real",PinSubCategory="double")', props[1])
+        self.assertIn('PinType=(PinCategory="int")', props[2])
+        self.assertIn('ResolvedWildcardType=(PinCategory="real",PinSubCategory="double")',
+                      graphbuild.describe({"id": "e", "type": "foreach", "element": {"cat": "real"}})[1])
+
+    def test_custom_event_param_needs_name_and_cat(self):
+        with self.assertRaises(graphbuild.SpecError):
+            graphbuild.describe({"id": "x", "type": "custom_event", "name": "Go", "params": [{"name": "A"}]})
+
+    def test_wildcard_real_gets_double(self):
+        tpl = {"class": "K2Node_MakeArray", "props": ["NumInputs=1"], "error": None,
+               "pins": [full_pin("[0]", "wildcard"), full_pin("Array", "wildcard", out=True)]}
+        n = {"id": "a", "type": "make_array", "count": 1, "element": {"cat": "float"}}
+        text = graphbuild.assemble([n], [], {"a": tpl}, "T1")["text"]
+        self.assertEqual(text.count('PinType.PinCategory="real",PinType.PinSubCategory="double",'), 2)
+        self.assertNotIn('PinSubCategory="",', text)
+        # the same when the template's pin text has no sub-category field at all
+        bare = tpl["pins"][0].replace('PinType.PinSubCategory="",', "")
+        text = graphbuild.assemble([n], [], {"a": dict(tpl, pins=[bare])}, "T1")["text"]
+        self.assertIn('PinType.PinCategory="real",PinType.PinSubCategory="double",', text)
+
+    def test_raw_props_object(self):
+        as_list = graphbuild.describe({"id": "r", "type": "raw", "kind": "K2Node_CustomEvent",
+                                       "props": ['CustomFunctionName="Go"', "FunctionFlags=16448", "bCommentBubbleVisible=False"]})
+        as_dict = graphbuild.describe({"id": "r", "type": "raw", "kind": "K2Node_CustomEvent",
+                                       "props": {"CustomFunctionName": '"Go"', "FunctionFlags": 16448, "bCommentBubbleVisible": False}})
+        self.assertEqual(as_list, as_dict)
+        self.assertEqual(as_dict[1], ['CustomFunctionName="Go"', "FunctionFlags=16448", "bCommentBubbleVisible=False"])
+
+    def test_node_class_and_usable_template(self):
+        self.assertEqual(graphbuild.node_class(NODES[0]), "K2Node_Event")
+        self.assertEqual(graphbuild.node_class({"id": "c", "type": "comment"}), "EdGraphNode_Comment")
+        self.assertEqual(graphbuild.node_class({"id": "r", "type": "raw", "kind": "/Script/BlueprintGraph.K2Node_Self"}), "K2Node_Self")
+        self.assertTrue(graphbuild.usable_template(EVENT))
+        self.assertFalse(graphbuild.usable_template(None))
+        self.assertFalse(graphbuild.usable_template(dict(EVENT, error="bad")))
+
+    def test_dropped_event_hint(self):
+        text = self.build()["text"]
+        gone = {"nodes_found": 1, "missing_nodes": ["T1_0"], "landed_in": {"Fn": 1}}
+        self.assertIn("landed in Fn", graphbuild.dropped_event_hint(text, gone))
+        self.assertIsNone(graphbuild.dropped_event_hint(text, dict(gone, landed_in={"EventGraph": 1})))
+        self.assertIsNone(graphbuild.dropped_event_hint(text, dict(gone, missing_nodes=["T1_1"])))
+        self.assertIsNone(graphbuild.dropped_event_hint(text, dict(gone, nodes_found=0, missing_nodes=["T1_0", "T1_1"], landed_in={})))
+
+
+class CompilerLog(unittest.TestCase):
+    LINES = [
+        r"[2026.11.07-02.30.16:430][668]LogBlueprint: Warning: [AssetLog] C:\Mods\X\Content\Blueprints\BP_Door.uasset: [Compiler] The structure cannot be broken",
+        r"[2026.11.07-02.30.16:431][668]LogBlueprint: Error: [AssetLog] C:\Mods\X\Content\Blueprints\BP_DoorFrame.uasset: [Compiler] Missing pin",
+        r"[2026.11.07-02.44.11:081][ 90]LogBlueprint: Warning: [AssetLog] Pak: ..\..\..\AbioticFactor\Content\Maps\Facility.umap: [Compiler] Node  Unknown  is not referencing a valid level actor",
+        r"[2026.11.07-02.44.11:081][ 90]LogPython: BP_Door compiled",
+    ]
+
+    def test_asset_from_the_path(self):
+        self.assertEqual(bpscan.compiler_message(self.LINES[0]), ("BP_Door", "warning", "The structure cannot be broken"))
+        self.assertEqual(bpscan.compiler_message(self.LINES[1])[:2], ("BP_DoorFrame", "error"))
+        self.assertEqual(bpscan.compiler_message(self.LINES[2])[0], "Facility")
+        self.assertIsNone(bpscan.compiler_message(self.LINES[3]))
+
+    def test_filter_by_asset_is_exact(self):
+        self.assertEqual([m[2] for m in (bpscan.compiler_message(l, "BP_Door") for l in self.LINES) if m], ["The structure cannot be broken"])
+        self.assertEqual([m[2] for m in (bpscan.compiler_message(l, "bp_doorframe") for l in self.LINES) if m], ["Missing pin"])
+
+    def test_line_without_a_path_matches_the_whole_word(self):
+        line = "[x]LogBlueprint: Error: BP_Door: [Compiler] Boom"
+        self.assertEqual(bpscan.compiler_message(line, "BP_Door"), (None, "error", "Boom"))
+        self.assertIsNone(bpscan.compiler_message(line, "BP_Do"))
+
+
+class Templates(unittest.TestCase):
+    """server.py's template bookkeeping, with the editor faked out."""
+
+    def setUp(self):
+        import server
+        self.server = server
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = (server.TEMPLATES, server.run_json, server.probe_nodes)
+        server.TEMPLATES = Path(self.tmp.name) / "node-templates.json"
+
+    def tearDown(self):
+        self.server.TEMPLATES, self.server.run_json, self.server.probe_nodes = self.saved
+        self.tmp.cleanup()
+
+    def fake_probe(self, result, log):
+        def probe(nodes, *args):
+            log.append([n["id"] for n in nodes])
+            return {graphbuild.template_key(n): result for n in nodes}
+        return probe
+
+    def test_event_of_a_class_the_parent_lacks_is_refused_before_probing(self):
+        s, probed = self.server, []
+        s.run_json = lambda body, args=None, **kw: {"parent": "/Script/UMG.UserWidget",
+                                                  "events": {"begin": {"owner_found": True, "interface": False, "is_ancestor": False}}}
+        s.probe_nodes = self.fake_probe(PRINT, probed)
+        templates, asked = s.templates_for(s.named_nodes(NODES), None, "/Script/UMG.UserWidget")
+        self.assertIn("doesn't descend", templates["begin"]["error"])
+        self.assertEqual(templates["say"], PRINT)
+        self.assertEqual((probed, asked), ([["say"]], 1))
+        self.assertEqual(list(json.loads(s.TEMPLATES.read_text())["nodes"].values()), [PRINT])
+
+    def test_interface_and_unknown_owners_go_to_the_probe(self):
+        s, probed = self.server, []
+        s.run_json = lambda body, args=None, **kw: {"parent": "/Script/Engine.Actor", "events": {
+            "begin": {"owner_found": True, "interface": True, "is_ancestor": False}}}
+        s.probe_nodes = self.fake_probe(EVENT, probed)
+        templates, _ = s.templates_for(s.named_nodes(NODES[:1]))
+        self.assertEqual(templates["begin"], EVENT)
+        self.assertEqual(probed, [["begin"]])
+
+    def test_a_probe_result_with_an_error_is_returned_but_not_kept(self):
+        s, probed = self.server, []
+        s.run_json = lambda *a, **k: {"parent": "/Script/Engine.Actor", "events": {}}
+        s.probe_nodes = self.fake_probe(dict(PRINT, error="the editor turned this K2Node_CallFunction into a K2Node_CustomEvent"), probed)
+        templates, _ = s.templates_for(s.named_nodes(NODES[1:]))
+        self.assertIn("turned this", templates["say"]["error"])
+        self.assertFalse(s.TEMPLATES.exists())
+
+    def test_loader_drops_what_older_versions_cached(self):
+        s = self.server
+        s.TEMPLATES.write_text(json.dumps({"build": s.editor_build(), "nodes": {
+            "good": PRINT, "turned": dict(EVENT, **{"class": "K2Node_CustomEvent"}), "flagged": dict(PRINT, error="x"), "refused": None}}))
+        self.assertEqual(list(s.load_templates()), ["good"])
 
 
 if __name__ == "__main__":

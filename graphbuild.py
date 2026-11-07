@@ -53,15 +53,32 @@ def _need(n, *keys):
             raise SpecError(f"node {n.get('id')!r} (type {n.get('type')}) needs {k!r}")
 
 
+def _pin_type(cat):
+    """(category, sub-category) as the editor writes a pin type. A float is 'real' with sub-category 'double' in this
+    engine; written as 'real' alone, the pin compiles as the wrong type ('Array of Floats' errors and the like)."""
+    if cat in ("real", "float", "double"):
+        return "real", "double"
+    return cat, ""
+
+
+def _type_text(cat, obj=None):
+    """The inside of a PinType=(...) struct for a category and an optional class or struct path."""
+    cat, sub = _pin_type(cat)
+    text = f'PinCategory="{cat}"'
+    if sub:
+        text += f',PinSubCategory="{sub}"'
+    if obj:
+        kind = "/Script/CoreUObject.Class" if cat in ("object", "class", "softobject", "softclass") else "/Script/CoreUObject.ScriptStruct"
+        text += f",PinSubCategoryObject=\"{kind}'{obj}'\""
+    return text
+
+
 def _user_pin(p):
     """A custom event parameter: {name, cat, obj?, array?}."""
-    obj = p.get("obj")
-    sub = ""
-    if obj:
-        kind = "/Script/CoreUObject.Class" if p.get("cat") in ("object", "class", "softobject", "softclass") else "/Script/CoreUObject.ScriptStruct"
-        sub = f",PinSubCategoryObject=\"{kind}'{obj}'\""
+    if not p.get("name") or not p.get("cat"):
+        raise SpecError(f"custom event parameter {p!r} needs name and cat")
     container = ",ContainerType=Array" if p.get("array") else ""
-    return (f'CustomProperties UserDefinedPin (PinName="{p["name"]}",PinType=(PinCategory="{p["cat"]}"{sub}{container}),'
+    return (f'CustomProperties UserDefinedPin (PinName="{p["name"]}",PinType=({_type_text(p["cat"], p.get("obj"))}{container}),'
             'DesiredPinDirection=EGPD_Output)')
 
 
@@ -134,7 +151,9 @@ def describe(n):
     if t == "raw":
         _need(n, "kind")
         kind = n["kind"] if "/" in n["kind"] else BG + n["kind"]
-        props = n.get("props", [])
+        props = n.get("props") or []
+        if isinstance(props, dict):      # {Key: Value}: each value goes in as written, so a string property keeps its quotes
+            props = [f"{k}={v}" for k, v in props.items()]
         return kind, [props] if isinstance(props, str) else list(props), list(n.get("pins", ()))
     raise SpecError(f"node {n.get('id')!r}: unknown type {t!r}. Types: call, array_call, call_parent, event, custom_event, var_get, var_set, "
                     "cast, branch, sequence, self, make_array, make_struct, break_struct, foreach, input_action, spawn_actor, add_component, "
@@ -142,11 +161,7 @@ def describe(n):
 
 
 def _wild_type(el):
-    sub = ""
-    if el.get("obj"):
-        kind = "/Script/CoreUObject.Class" if el.get("cat") in ("object", "class", "softobject", "softclass") else "/Script/CoreUObject.ScriptStruct"
-        sub = f",PinSubCategoryObject=\"{kind}'{el['obj']}'\""
-    return f'(PinCategory="{el["cat"]}"{sub})'
+    return "(" + _type_text(el["cat"], el.get("obj")) + ")"
 
 
 def template_key(n):
@@ -163,6 +178,16 @@ def is_stable(n):
         if isinstance(v, str) and v.startswith(("/Script/", "/Game/")):
             return True
     return False
+
+
+def node_class(n):
+    """The node class a spec node asks for, as an export names it (K2Node_Event, EdGraphNode_Comment, ...)."""
+    return describe(n)[0].split(".")[-1]
+
+
+def usable_template(t):
+    """A probe result worth building from or keeping: the editor allocated the node and reported no error on it."""
+    return bool(t) and not t.get("error")
 
 
 def bare_text(items):
@@ -261,9 +286,15 @@ def _retype(raw, element):
     """Give a wildcard pin the concrete type the node's `element` names. Other pins keep theirs."""
     if 'PinType.PinCategory="wildcard"' not in raw:
         return raw
-    raw = raw.replace('PinType.PinCategory="wildcard"', f'PinType.PinCategory="{element["cat"]}"')
+    cat, sub = _pin_type(element["cat"])
+    raw = raw.replace('PinType.PinCategory="wildcard"', f'PinType.PinCategory="{cat}"')
+    if sub:
+        if re.search(r'PinType\.PinSubCategory="[^"]*"', raw):
+            raw = re.sub(r'PinType\.PinSubCategory="[^"]*"', f'PinType.PinSubCategory="{sub}"', raw, count=1)
+        else:
+            raw = raw.replace(f'PinType.PinCategory="{cat}"', f'PinType.PinCategory="{cat}",PinType.PinSubCategory="{sub}"', 1)
     if element.get("obj"):
-        kind = "/Script/CoreUObject.Class" if element["cat"] in ("object", "class", "softobject", "softclass") else "/Script/CoreUObject.ScriptStruct"
+        kind = "/Script/CoreUObject.Class" if cat in ("object", "class", "softobject", "softclass") else "/Script/CoreUObject.ScriptStruct"
         raw = re.sub(r"PinType\.PinSubCategoryObject=[^,]*", f"PinType.PinSubCategoryObject=\"{kind}'{element['obj']}'\"", raw, count=1)
     return raw
 
@@ -516,3 +547,22 @@ def verify(sent_text, export_text):
             "pure_nodes": pure, "joined_links": _link_report(joined & kept, found),
             "problems": problems, "landed_in": landed,
             "ok": not (missing_nodes or missing_links or changed)}
+
+
+EVENT_NODES = ("K2Node_Event", "K2Node_CustomEvent", "K2Node_Input", "K2Node_ComponentBoundEvent", "K2Node_ActorBoundEvent", "K2Node_Timeline")
+
+
+def dropped_event_hint(sent_text, result):
+    """Why a paste's event nodes went missing while the rest arrived: a paste goes to the graph tab that is showing, and
+    only an event graph can hold events, so a function graph drops them. None when that isn't what happened."""
+    missing = set(result.get("missing_nodes") or ())
+    landed = [g for g in (result.get("landed_in") or {}) if g]
+    if not missing or not landed or "EventGraph" in landed:
+        return None
+    classes = {n["name"]: n["class"].split(".")[-1] for n in bpscan.parse_t3d(sent_text)["nodes"]}
+    events = sorted(n for n in missing if classes.get(n, "").startswith(EVENT_NODES))
+    if not events:
+        return None
+    return (f"{len(events)} event node(s) didn't arrive ({', '.join(events)}): the paste landed in {', '.join(landed)}, the graph tab "
+            "that was showing, and only an Event Graph can hold events, so the editor dropped them. Bring the Event Graph tab forward "
+            "(open_asset with show_graph=true, or click its tab) and paste again.")

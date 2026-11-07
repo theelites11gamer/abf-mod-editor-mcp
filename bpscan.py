@@ -54,6 +54,30 @@ def parse_filter_dumps(lines):
     return dumps
 
 
+# ---- compiler log lines ----------------------------------------------------------
+# LogBlueprint: Error: [AssetLog] C:\...\Content\Blueprints\BP_X.uasset: [Compiler] message
+
+_ASSET_LOG = re.compile(r"\[AssetLog\] (.*?): $")
+
+
+def compiler_message(line, asset=None):
+    """(asset name or None, 'error' | 'warning', message) for a [Compiler] log line, else None. With `asset`, only lines
+    about that asset: the AssetLog path's file name, so BP_Door's errors aren't counted for BP_Do, or, on a line with no
+    path, the name as a whole word."""
+    head, sep, message = line.partition("[Compiler]")
+    if not sep:
+        return None
+    m = _ASSET_LOG.search(head)
+    name = m.group(1).replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0] if m else None
+    if asset is not None:
+        if name is not None:
+            if name.lower() != asset.lower():
+                return None
+        elif not re.search(r"(?<![A-Za-z0-9_])" + re.escape(asset) + r"(?![A-Za-z0-9_])", head, re.I):
+            return None
+    return name, ("error" if "Error:" in head else "warning"), message.strip()
+
+
 # ---- T3D parsing ------------------------------------------------------------
 # A Blueprint export lists each object twice under its graph: first a bare declaration
 # (`Begin Object Class=... Name=...` / `End Object`), then a definition (`Begin Object Name=...`)
