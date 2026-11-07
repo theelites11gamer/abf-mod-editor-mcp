@@ -158,9 +158,8 @@ class BITMAPINFOHEADER(ctypes.Structure):
                 ("biClrImportant", wt.DWORD)]
 
 
-def capture(win, max_width=1600):
-    """PNG bytes of one editor window (PrintWindow, so other windows on top don't matter)
-    and the integer downscale factor used."""
+def pixels(win):
+    """Raw BGRA pixels of one editor window (PrintWindow, so other windows on top don't matter): (bytes, width, height)."""
     h = win["hwnd"]
     if user32.IsIconic(h):
         user32.ShowWindow(h, 9)
@@ -179,12 +178,23 @@ def capture(win, max_width=1600):
         bi.biWidth, bi.biHeight, bi.biPlanes, bi.biBitCount = w, -hgt, 1, 32
         buf = ctypes.create_string_buffer(w * hgt * 4)
         gdi32.GetDIBits(mem, bmp, 0, hgt, buf, ctypes.byref(bi), 0)
-        raw = buf.raw
+        return buf.raw, w, hgt
     finally:
         gdi32.SelectObject(mem, old)
         gdi32.DeleteObject(bmp)
         gdi32.DeleteDC(mem)
         user32.ReleaseDC(h, hdc)
+
+
+def pixel(raw, w, x, y):
+    """(r, g, b) at a window pixel of a pixels() buffer."""
+    i = (y * w + x) * 4
+    return raw[i + 2], raw[i + 1], raw[i]
+
+
+def capture(win, max_width=1600):
+    """PNG bytes of one editor window and the integer downscale factor used."""
+    raw, w, hgt = pixels(win)
     f = max(1, -(-w // max_width))
     ow, oh = len(range(0, w, f)), len(range(0, hgt, f))
     rows = []

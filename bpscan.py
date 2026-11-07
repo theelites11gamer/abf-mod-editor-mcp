@@ -226,7 +226,7 @@ def parse_t3d(text, include_dead=False, keep_body=False):
             dead += 1
             if not include_dead:
                 continue
-        node = {"name": o["name"], "class": short, "graph": graph}
+        node = {"name": o["name"], "class": short, "class_path": o["class"], "graph": graph}
         if include_dead:
             node["live"] = live
         _parse_node_props(node, btxt)

@@ -646,6 +646,15 @@ class CompilerLog(unittest.TestCase):
         self.assertIsNone(bpscan.compiler_message(line, "BP_Do"))
 
 
+class GraphBackground(unittest.TestCase):
+    def test_greys_of_the_grid_only(self):
+        import server
+        for rgb in ((38, 38, 38), (53, 53, 53), (36, 36, 36), (51, 51, 51)):
+            self.assertTrue(server.is_graph_background(rgb), rgb)
+        for rgb in ((24, 24, 24), (21, 21, 21), (183, 183, 183), (109, 23, 22), (42, 62, 71), (75, 75, 75)):
+            self.assertFalse(server.is_graph_background(rgb), rgb)
+
+
 class Templates(unittest.TestCase):
     """server.py's template bookkeeping, with the editor faked out."""
 
@@ -699,6 +708,146 @@ class Templates(unittest.TestCase):
         s.TEMPLATES.write_text(json.dumps({"build": s.editor_build(), "nodes": {
             "good": PRINT, "turned": dict(EVENT, **{"class": "K2Node_CustomEvent"}), "flagged": dict(PRINT, error="x"), "refused": None}}))
         self.assertEqual(list(s.load_templates()), ["good"])
+
+MERGE_EXPORT = "\n".join([
+    'Begin Object Class=/Script/Engine.Blueprint Name="BP_M" ExportPath="x"',
+    '   Begin Object Class=/Script/Engine.EdGraph Name="EventGraph" ExportPath="x"',
+    '      Begin Object Class=/Script/BlueprintGraph.K2Node_Event Name="E_0" ExportPath="x"',
+    "      End Object",
+    '      Begin Object Class=/Script/UMGEditor.K2Node_CreateWidget Name="C_1" ExportPath="x"',
+    "      End Object",
+    "   End Object",
+    '   Begin Object Class=/Script/Engine.EdGraph Name="Fn" ExportPath="x"',
+    '      Begin Object Class=/Script/BlueprintGraph.K2Node_FunctionEntry Name="FE_0" ExportPath="x"',
+    "      End Object",
+    '      Begin Object Class=/Script/BlueprintGraph.K2Node_CallFunction Name="FC_1" ExportPath="x"',
+    "      End Object",
+    "   End Object",
+    '   Begin Object Name="EventGraph" ExportPath="x"',
+    '      Begin Object Name="E_0" ExportPath="x"',
+    '         EventReference=(MemberParent="/Script/CoreUObject.Class\'/Script/Engine.Actor\'",MemberName="ReceiveBeginPlay")',
+    "         bOverrideFunction=True",
+    "         NodePosX=100",
+    "         NodePosY=200",
+    "         NodeGuid=AAAA",
+    '         ErrorMsg="stale"',
+    "         ErrorType=1",
+    "         " + pin("AA", "then", out=True, links="C_1 BB,"),
+    "      End Object",
+    '      Begin Object Name="C_1" ExportPath="x"',
+    '         FunctionReference=(MemberParent="/Script/CoreUObject.Class\'/Script/Engine.KismetSystemLibrary\'",MemberName="PrintString")',
+    "         NodePosX=500",
+    "         NodePosY=200",
+    "         " + pin("BB", "execute", links="E_0 AA,"),
+    "         " + pin("CC", "then", out=True),
+    "         " + pin("DD", "InString", "string"),
+    "      End Object",
+    "      Nodes(0)=\"/Script/BlueprintGraph.K2Node_Event'E_0'\"",
+    "      Nodes(1)=\"/Script/UMGEditor.K2Node_CreateWidget'C_1'\"",
+    "   End Object",
+    '   Begin Object Name="Fn" ExportPath="x"',
+    '      Begin Object Name="FE_0" ExportPath="x"',
+    "         " + pin("EE", "then", out=True, links="FC_1 FF,"),
+    "      End Object",
+    '      Begin Object Name="FC_1" ExportPath="x"',
+    '         FunctionReference=(MemberParent="/Script/CoreUObject.Class\'/Script/Engine.Actor\'",MemberName="K2_DestroyActor")',
+    "         " + pin("FF", "execute", links="FE_0 EE,"),
+    "         " + pin("GG", "then", out=True),
+    "      End Object",
+    "      Nodes(0)=\"/Script/BlueprintGraph.K2Node_FunctionEntry'FE_0'\"",
+    "      Nodes(1)=\"/Script/BlueprintGraph.K2Node_CallFunction'FC_1'\"",
+    "   End Object",
+    "   UbergraphPages(0)=\"/Script/Engine.EdGraph'EventGraph'\"",
+    "   FunctionGraphs(0)=\"/Script/Engine.EdGraph'Fn'\"",
+    "End Object",
+])
+
+
+class Merging(unittest.TestCase):
+    def existing(self, graph="EventGraph", text=MERGE_EXPORT):
+        return graphbuild.existing_nodes(bpscan.parse_t3d(text, keep_body=True), graph)
+
+    def merge(self, links, nodes=None, graph="EventGraph"):
+        nodes = [NODES[1]] if nodes is None else nodes
+        return graphbuild.assemble(nodes, links, {"say": PRINT}, "M", existing=self.existing(graph))
+
+    def test_existing_nodes_split(self):
+        ev = self.existing()
+        self.assertEqual(([n["name"] for n in ev["paste"]], ev["kept"]), (["E_0", "C_1"], []))
+        fn = self.existing("Fn")
+        self.assertEqual(([n["name"] for n in fn["paste"]], [n["name"] for n in fn["kept"]]), (["FC_1"], ["FE_0"]))
+        self.assertEqual(self.existing("Nope"), {"graph": "Nope", "paste": [], "kept": []})
+
+    def test_timeline_cannot_be_merged(self):
+        text = MERGE_EXPORT.replace("K2Node_CreateWidget", "K2Node_Timeline")
+        with self.assertRaises(graphbuild.SpecError):
+            self.existing(text=text)
+
+    def test_new_node_linked_to_an_existing_one(self):
+        r = self.merge([["C_1.then", "say.execute"]])
+        self.assertEqual(r["problems"], [])
+        self.assertEqual(r["renamed"], {"E_0": "M_x0", "C_1": "M_x1"})
+        self.assertEqual(r["names"], {"say": "M_0"})
+        parsed = bpscan.parse_t3d(r["text"])["nodes"]
+        self.assertEqual([n["name"] for n in parsed], ["M_x0", "M_x1", "M_0"])
+        self.assertEqual(bpscan.links_of(parsed), {bpscan.link_key(("M_x0", "then"), ("M_x1", "execute")),
+                                                   bpscan.link_key(("M_x1", "then"), ("M_0", "execute"))})
+        self.assertEqual(graphbuild.lint(r["text"]), {"errors": [], "warnings": [], "nodes": 3})
+        self.assertIn('Class=/Script/UMGEditor.K2Node_CreateWidget Name="M_x1"', r["text"])
+        self.assertIn("EventReference=", r["text"])
+        self.assertNotIn("ErrorMsg", r["text"])
+        self.assertNotIn("ExportPath", r["text"])
+        self.assertIn("NodeGuid=AAAA", r["text"])                     # the old node's own, kept as it was
+        self.assertRegex(r["text"], r'Name="M_0"[\s\S]*NodePosX=100\nNodePosY=520')    # below the old nodes, at their left
+
+    def test_old_paste_markers_are_dropped(self):
+        text = MERGE_EXPORT.replace('Begin Object Class=/Script/UMGEditor.K2Node_CreateWidget Name="C_1"',
+                                    'Begin Object Class=/Script/UnrealEd.EdGraphNode_Comment Name="McpPasteEnd_1"')
+        text = text.replace("Nodes(1)=\"/Script/UMGEditor.K2Node_CreateWidget'C_1'\"", "Nodes(1)=\"/Script/UnrealEd.EdGraphNode_Comment'McpPasteEnd_1'\"")
+        text = text.replace('Begin Object Name="C_1"', 'Begin Object Name="McpPasteEnd_1"')
+        self.assertEqual([n["name"] for n in self.existing(text=text)["paste"]], ["E_0"])
+
+    def test_placeholder_events_are_dropped(self):
+        ghost = MERGE_EXPORT.replace("bOverrideFunction=True", "bOverrideFunction=True" + chr(10) + "         EnabledState=Disabled")
+        self.assertEqual([n["name"] for n in self.existing(text=ghost)["paste"]], ["C_1"])
+        user_disabled = ghost.replace("EnabledState=Disabled", "EnabledState=Disabled" + chr(10) + "         bUserSetEnabledState=True")
+        self.assertEqual([n["name"] for n in self.existing(text=user_disabled)["paste"]], ["E_0", "C_1"])
+
+    def test_existing_links_survive_with_no_new_nodes(self):
+        r = graphbuild.assemble([], [], {}, "B", existing=self.existing())
+        parsed = bpscan.parse_t3d(r["text"])["nodes"]
+        self.assertEqual(bpscan.links_of(parsed), {("B_x0", "then", "B_x1", "execute")})
+        self.assertEqual(graphbuild.lint(r["text"])["warnings"], [])
+
+    def test_links_to_a_kept_node_are_reported_and_stripped(self):
+        r = self.merge([["FC_1.then", "say.execute"]], graph="Fn")
+        self.assertEqual(r["problems"], [])
+        self.assertEqual(r["rewire"], [{"from": "M_x0.execute", "to": "FE_0.then", "was": "FC_1.execute"}])
+        self.assertNotIn("FE_0", r["text"])
+        self.assertEqual(graphbuild.lint(r["text"])["warnings"], [])
+
+    def test_link_to_a_kept_node_is_a_problem(self):
+        r = self.merge([["FE_0.then", "say.execute"]], graph="Fn")
+        self.assertIn("wire that one in the editor", r["problems"][0])
+
+    def test_unknown_existing_name(self):
+        r = self.merge([["Nope.then", "say.execute"]])
+        self.assertIn("no node with id 'Nope'", r["problems"][0])
+        self.assertIn("inspect_blueprint", r["problems"][0])
+
+    def test_bad_pin_on_an_existing_node_lists_its_pins(self):
+        r = self.merge([["C_1.exec", "say.execute"]])
+        self.assertIn("no pin 'exec'", r["problems"][0])
+        self.assertIn("execute", r["problems"][0])
+
+    def test_spec_id_clashing_with_an_existing_name(self):
+        r = graphbuild.assemble([dict(NODES[1], id="C_1")], [], {"C_1": PRINT}, "M", existing=self.existing())
+        self.assertIn("same name as a spec node id", r["problems"][0])
+
+    def test_without_existing_nothing_changes(self):
+        r = graphbuild.assemble(NODES, LINKS, TEMPLATES, "T1")
+        self.assertEqual((r["renamed"], r["rewire"], r["problems"]), ({}, [], []))
+        self.assertEqual([n["name"] for n in bpscan.parse_t3d(r["text"])["nodes"]], ["T1_0", "T1_1"])
 
 
 if __name__ == "__main__":

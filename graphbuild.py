@@ -325,12 +325,51 @@ def _layout(ids, edges):
     return pos
 
 
-def assemble(nodes, links, templates, prefix):
-    """Final clipboard text. nodes: spec nodes with 'id'. links: ['a.then', 'b.execute'] pairs. templates: {id: template}.
+# ---- merging into a graph that already has nodes ---------------------------------
 
-    Returns {'text', 'names', 'problems', 'warnings', 'links'}. With problems, 'text' is None: nothing should be pasted.
+KEPT_NODES = ("K2Node_FunctionEntry", "K2Node_FunctionResult", "K2Node_Tunnel")
+UNMERGEABLE = {"K2Node_Timeline": "a Timeline node, and a paste can't carry its curves",
+               "K2Node_Composite": "a collapsed graph; expand it first"}
+STALE_PROP = re.compile(r"^\s*(bHasCompilerMessage|ErrorType|ErrorMsg)=")
+_POS = re.compile(r"^\s*NodePos([XY])=(-?\d+)")
+
+
+def _ghost(n):
+    """An event node the editor placed disabled in a new Blueprint as a hint (the greyed-out BeginPlay, Tick and overlap).
+    It holds no logic, and the editor removes it itself when the real event arrives, so a merge leaves it out."""
+    body = [line.strip() for line in n.get("body", ())]
+    return "EnabledState=Disabled" in body and "bUserSetEnabledState=True" not in body
+
+
+def _marker(n):
+    return n["class"] == "EdGraphNode_Comment" and n["name"].startswith("McpPasteEnd_")     # an earlier paste's end comment
+
+
+def existing_nodes(parsed, graph):
+    """The live nodes of one graph of a parsed export (parse_t3d with keep_body=True): those a merge re-pastes under
+    'paste', and under 'kept' those that stay, a function's entry, result and tunnel nodes, which a paste can't carry."""
+    live = [n for n in parsed["nodes"] if n.get("graph") == graph and n.get("live", True) and not _marker(n) and not _ghost(n)]
+    bad = [f"{n['name']} is {UNMERGEABLE[n['class']]}" for n in live if n["class"] in UNMERGEABLE]
+    if bad:
+        raise SpecError(f"can't merge into {graph}: " + "; ".join(bad))
+    return {"graph": graph, "paste": [n for n in live if n["class"] not in KEPT_NODES], "kept": [n for n in live if n["class"] in KEPT_NODES]}
+
+
+def _pin_entry(raw, pin_id):
+    p = bpscan.parse_pin(raw)
+    return {"raw": raw, "id": pin_id or p["id"], "dir": p["dir"], "type": p["type"], "links": [], "default": None, "name": p["name"]}, p
+
+
+def assemble(nodes, links, templates, prefix, existing=None):
+    """Final clipboard text. nodes: spec nodes with 'id'. links: ['a.then', 'b.execute'] pairs. templates: {id: template}.
+    existing (from existing_nodes): a graph's current nodes, re-pasted under new names with the links they have, so a
+    link may name one of them by its old name.
+
+    Returns {'text', 'names', 'problems', 'warnings', 'links', 'renamed', 'rewire'}. With problems, 'text' is None:
+    nothing should be pasted.
     """
     problems, warnings = [], []
+    existing = existing or {"paste": [], "kept": []}
     by_id = {}
     for n in nodes:
         if not n.get("id"):
@@ -350,20 +389,47 @@ def assemble(nodes, links, templates, prefix):
             continue
         if tpl.get("error"):
             problems.append(f"{nid}: the editor reports: {tpl['error']}")
-        pins = {}
-        order = []
+        pinlist, pins = [], {}
         for raw in tpl["pins"]:
             if n.get("element"):
                 raw = _retype(raw, n["element"])
-            p = bpscan.parse_pin(raw)
-            pins[p["name"]] = {"raw": raw, "id": new_id(), "dir": p["dir"], "type": p["type"], "links": [], "default": None}
-            order.append(p["name"])
+            entry, _ = _pin_entry(raw, new_id())
+            pinlist.append(entry)
+            pins.setdefault(entry["name"], entry)
         for key, value in (n.get("args") or {}).items():
             if key not in pins:
-                problems.append(f"{nid}: no pin {key!r} for a default. Pins: {_close_names(key, order)}")
+                problems.append(f"{nid}: no pin {key!r} for a default. Pins: {_close_names(key, [e['name'] for e in pinlist])}")
                 continue
             pins[key]["default"] = _default_fields(pins[key]["type"], value)
-        built[nid] = {"name": f"{prefix}_{i}", "tpl": tpl, "pins": pins, "order": order, "spec": n}
+        built[nid] = {"name": f"{prefix}_{i}", "tpl": tpl, "pins": pins, "pinlist": pinlist, "spec": n}
+
+    # The graph's own nodes: new names (the deleted originals linger until garbage collection, and a pasted node whose
+    # name is taken gets renamed), the links among them kept, their links to the nodes that stay reported.
+    renamed = {n["name"]: f"{prefix}_x{i}" for i, n in enumerate(existing["paste"])}
+    kept = {n["name"]: n for n in existing["kept"]}
+    rewire = []
+    for n in existing["paste"]:
+        old = n["name"]
+        if old in by_id:
+            problems.append(f"existing node {old} has the same name as a spec node id; give the spec node another id")
+            continue
+        pinlist, pins = [], {}
+        for line in n["body"]:
+            m = PIN_LINE.match(line)
+            if not m:
+                continue
+            entry, p = _pin_entry(m.group(1), None)
+            for target, tid in p.get("linked_ids", ()):
+                if target in renamed:
+                    entry["links"].append((renamed[target], tid))
+                elif target in kept:
+                    pin_name = next((q["name"] for q in kept[target]["pins"] if q.get("id") == tid), tid)
+                    rewire.append({"from": f"{renamed[old]}.{p['name']}", "to": f"{target}.{pin_name}", "was": f"{old}.{p['name']}"})
+                else:
+                    warnings.append(f"{old}.{p['name']} was linked to {target}, which isn't a live node of this graph: that link is dropped")
+            pinlist.append(entry)
+            pins.setdefault(entry["name"], entry)
+        built[old] = {"name": renamed[old], "existing": n, "pins": pins, "pinlist": pinlist}
 
     edges, link_count = [], 0
     for link in links:
@@ -373,14 +439,16 @@ def assemble(nodes, links, templates, prefix):
         ends = []
         for end in link:
             nid, _, pin = str(end).partition(".")
-            if nid not in by_id:
-                problems.append(f"link {link}: no node with id {nid!r}")
-            elif nid not in built:
-                pass                              # already reported above
-            elif pin not in built[nid]["pins"]:
-                problems.append(f"link {link}: {nid} has no pin {pin!r}. Pins: {_close_names(pin, built[nid]['order'])}")
-            else:
-                ends.append((nid, pin))
+            if nid in kept:
+                problems.append(f"link {link}: {nid} stays in the graph (a function's entry and result nodes can't be re-pasted), "
+                                "so a paste can't link to it; wire that one in the editor")
+            elif nid in built:
+                if pin not in built[nid]["pins"]:
+                    problems.append(f"link {link}: {nid} has no pin {pin!r}. Pins: {_close_names(pin, [e['name'] for e in built[nid]['pinlist']])}")
+                else:
+                    ends.append((nid, pin))
+            elif nid not in by_id:
+                problems.append(f"link {link}: no node with id {nid!r}" + (" (existing nodes go by the name inspect_blueprint shows)" if existing["paste"] else ""))
         if len(ends) != 2:
             continue
         (an, ap), (bn, bp) = ends
@@ -406,23 +474,40 @@ def assemble(nodes, links, templates, prefix):
             warnings.append(f"{n['id']}: a variable with an owner needs a target linked to its self pin. Leave the owner out for this Blueprint's own or inherited variables.")
 
     if problems:
-        return {"text": None, "names": {}, "problems": problems, "warnings": warnings, "links": link_count}
+        return {"text": None, "names": {}, "problems": problems, "warnings": warnings, "links": link_count, "renamed": {}, "rewire": rewire}
 
-    auto = _layout([n["id"] for n in nodes], edges)
+    def linked_to(pin):
+        return "(" + "".join(f"{t} {i}," for t, i in pin["links"]) + ")" if pin["links"] else None
+
     chunks = []
+    xs, ys = [], []
+    for n in existing["paste"]:               # first, as they were, with stale compiler marks left out
+        b = built[n["name"]]
+        props = []
+        for line in n["body"]:
+            m = _POS.match(line)
+            if m:
+                (xs if m.group(1) == "X" else ys).append(int(m.group(2)))
+            if line.strip() and not PIN_LINE.match(line) and not STALE_PROP.match(line):
+                props.append(line.strip())
+        lines = [f'Begin Object Class={n.get("class_path") or BG + n["class"]} Name="{b["name"]}"'] + props
+        lines += [f"CustomProperties Pin ({_set_field(pin['raw'], 'LinkedTo', linked_to(pin))})" for pin in b["pinlist"]]
+        lines.append("End Object")
+        chunks.append("\n".join(lines))
+    ox, oy = (min(xs), max(ys) + 320) if xs and ys else (0, 0)       # new nodes go below the old ones
+    auto = _layout([n["id"] for n in nodes], [(a, b) for a, b in edges if a in by_id and b in by_id])
     for n in nodes:
         b = built[n["id"]]
-        x, y = n.get("x", auto[n["id"]][0]), n.get("y", auto[n["id"]][1])
+        x, y = n.get("x", auto[n["id"]][0] + ox), n.get("y", auto[n["id"]][1] + oy)
         props = list(b["tpl"]["props"])
         have = {p.split("=", 1)[0] for p in props}
         # A bare node with nothing linked can forget what it was given (a macro's ResolvedWildcardType), so the spec's come back.
         props += [p for p in describe(n)[1] if p.split("=", 1)[0] not in have and not p.startswith("CustomProperties")]
         lines = [f'Begin Object Class={class_path(b["tpl"]["class"], n)} Name="{b["name"]}"'] + props
         lines += [f"NodePosX={int(x)}", f"NodePosY={int(y)}", f"NodeGuid={new_id()}"]
-        for name in b["order"]:
-            pin = b["pins"][name]
+        for pin in b["pinlist"]:
             raw = re.sub(r"PinId=[0-9A-Fa-f]+", "PinId=" + pin["id"], pin["raw"], count=1)
-            raw = _set_field(raw, "LinkedTo", "(" + "".join(f"{t} {i}," for t, i in pin["links"]) + ")" if pin["links"] else None)
+            raw = _set_field(raw, "LinkedTo", linked_to(pin))
             if pin["default"]:
                 for field in ("DefaultValue", "DefaultObject", "DefaultTextValue"):
                     raw = _set_field(raw, field, None)
@@ -431,7 +516,7 @@ def assemble(nodes, links, templates, prefix):
         lines.append("End Object")
         chunks.append("\n".join(lines))
     return {"text": "\n".join(chunks) + "\n", "names": {n["id"]: built[n["id"]]["name"] for n in nodes},
-            "problems": [], "warnings": warnings, "links": link_count}
+            "problems": [], "warnings": warnings, "links": link_count, "renamed": renamed, "rewire": rewire}
 
 
 def class_path(short, n):

@@ -47,7 +47,7 @@ The server uses remote execution first and the bridge second, opens a fresh conn
 | Python | `run_python`, `evaluate_python`, `run_python_file` (`args` → `ARGS` inside the script) |
 | Mod data | `list_mods`, `list_mod_templates`, `find_assets`, `get_row`, `set_row` (plain values, Python expressions, or whole export text), `create_row_asset` (any of the 72 `*ModRowAsset` classes, optionally copied from a base-game row or another mod row), `delete_asset`, `save_assets`, `validate_assets` |
 | Base-game data | `get_game_row` — list or read any row the game exposes through its `<Kind>HandleFunctionLibrary` (gear_item, weapon_item, recipe, buff_debuff, npc, pet, trait, …) |
-| Blueprints | `build_graph` (node list → graph, every pin checked against the editor), `discover_pins` (the real pins of any node), `paste_graph` (clipboard T3D → graph, then checks what arrived), `compile_blueprint` (reports the compiler's errors; a Blueprint with errors isn't saved), `inspect_blueprint` (parent, variables, graphs, every reference, errors, nodes and pins), `export_t3d`, `t3d_errors`, `blueprint_filter_check` |
+| Blueprints | `build_graph` (node list → graph, every pin checked against the editor; `merge` links new nodes to a graph's existing ones), `discover_pins` (the real pins of any node), `paste_graph` (clipboard T3D → graph, then checks what arrived), `compile_blueprint` (reports the compiler's errors; a Blueprint with errors isn't saved), `inspect_blueprint` (parent, variables, graphs, every reference, errors, nodes and pins), `export_t3d`, `t3d_errors`, `blueprint_filter_check` |
 | Window | `open_asset`, `close_asset`, `editor_windows`, `editor_screenshot` (one editor window, returned as an image, works in the background), `editor_click`, `editor_keys`, `close_editor_window` |
 | Map and play | `load_map`, `play_in_editor` start/stop, `pie_info` (players, pawns, locations, chosen pawn properties), `console_command` (editor or game world) |
 | Release | `check_upload` (offline pre-upload check), `read_editor_log` |
@@ -91,18 +91,38 @@ It never guesses a pin. Each kind of node is first pasted bare into a throwaway 
 
 The result also lists anything the upload filter would block. For nodes `build_graph` has no type for, `raw` takes a node class and properties, as `Key=Value` lines or an object whose values are written as given (so a string property keeps its quotes). `paste_graph` does the same pasting and checking for T3D you already have.
 
+### Adding to a graph that already has nodes
+
+A paste can't link to nodes that are already in the graph, so `build_graph` with `merge: true` re-pastes them: it exports the graph, clears it, and pastes its existing nodes together with the new ones, links included. A link may then name an existing node by the name `inspect_blueprint` shows:
+
+```json
+{
+  "asset_path": "/MyMod/Blueprints/BP_MyActor",
+  "merge": true, "paste": true, "compile": true,
+  "nodes": [
+    {"id": "more", "owner": "/Script/AbioticFactor.AbioticFunctionLibrary", "function": "AbioticLog", "args": {"LogMessage": "and again"}}
+  ],
+  "links": [["K2Node_CallFunction_12.then", "more.execute"]]
+}
+```
+
+Existing nodes come back under new names, reported under `merge.renamed` (the deleted originals linger until garbage collection, and a pasted node whose name is taken gets renamed), and keep their positions and links; new nodes are laid out below them. The disabled placeholder events a new Blueprint comes with (the greyed-out BeginPlay, Tick and overlap hints) are left out. Before anything is cleared, the existing nodes are written as clipboard text to `exports/merge/<prefix>-before.t3d`, which `paste_graph` with `clear` puts back. Without `paste` it's a dry run that reports what would change. `graph` picks the graph (default `EventGraph`); its tab has to be showing, and nothing is deleted until a marker paste proves it is.
+
+Limits: a function's entry and result nodes can't be re-pasted, so links to them are lost and listed under `merge.links_to_rewire` (wire those in the editor); a graph holding a Timeline or a collapsed graph can't be merged; the emptied graph is compiled before the paste when custom events are involved, so their names survive; the whole graph lands centred on the paste point, so it may move.
+
 ## Working notes
 
 - Mod row assets are `PrimaryDataAsset`s; `row_name` defaults to the asset name and the game adds the mod prefix at runtime.
 - Paste in passes: custom events must exist and be compiled before anything calls them, or the calls are dropped. `build_graph` resolves a Blueprint's own functions by building its throwaway Blueprint as a child of the one you name, so the same rule applies there.
 - The editor drops every link of the last node in a paste. `paste_graph` and `build_graph` end each paste with a small comment node so that's never a real node; it's safe to delete.
-- Pasted nodes can't link to nodes already in the graph, like a function's entry node. Wire those in the editor, or with `editor_click` and `editor_keys`.
+- Pasted nodes can't link to nodes already in the graph. `build_graph` with `merge` re-pastes the graph's own nodes with the new ones to get round that; a function's entry and result nodes are the exception, so wire links to those in the editor, or with `editor_click` and `editor_keys`.
 - A call to a function the Blueprint doesn't have, pasted as raw T3D, opens a Fix Self Context Function References dialog that blocks the editor. `paste_graph` reports it under `dialogs`; close it with `close_editor_window`. `build_graph` names the class instead, so it gets an error and no dialog. Deletes never run through the file bridge, because that can happen behind a dialog and has crashed the editor.
 - A variable with an `owner` needs a target linked to its `self` pin. Leave the owner out for the Blueprint's own or inherited variables.
 - A pasted copy of an event that already exists in the graph, including a greyed-out default one, turns into a custom event that nothing calls. The paste report lists these under `changed_class`; delete the old event first, or paste with `clear`.
 - A pure function has no exec pins. If pasted T3D links some on one, the editor removes them and joins what led into the node to what came after it. That graph is right, so the paste report counts it as fine, with a lint warning and the details under `pure_nodes` and `joined_links`. If the joined link isn't there, it's under `missing_links` and the paste fails. An exec output can only hold one link, so a pure node's `then` joins to the first of several.
 - `clear` first pastes a marker comment and reads it back, so its Ctrl+A and Delete can only happen with a graph focused. On the Viewport tab they would delete components.
 - A new Blueprint opens on its Viewport tab and a widget on its Designer. `paste_graph` brings the Event Graph or Graph view forward when nothing arrives, using positions in the default window layout. For a function's graph, open its tab first.
+- Where a paste clicks: the usual point past the greyed-out default events when the window shows only the grid around it, else the nearest spot of the graph panel that does (the grid is two greys; nodes and pin text boxes are lighter). A paste centres its nodes on the click, so the spot is looked for afresh before every paste; the report says where (`at`) and how (`spot`).
 - T3D exports also hold deleted nodes and whole graphs the compiler generates. The tools count only live nodes in the graphs the Blueprint lists itself; `inspect_blueprint(include_deleted=true)` shows the rest.
 - A T3D export is plain ASCII until the asset holds any other character, like a `°` in a text block. Then the whole file is UTF-16 with a byte-order mark. Read exports with `bpscan.read_t3d`, which handles both: read as UTF-8, a UTF-16 export parses as an empty Blueprint with no error.
 - A new mod project can't be created from Python (the template system has no entry point). Do it in the picker: ITEMS tile → template → name → Create. `editor_screenshot` + `editor_click`/`editor_keys` can drive it.

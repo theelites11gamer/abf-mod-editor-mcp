@@ -35,7 +35,7 @@ import graphbuild  # noqa: E402
 import paths     # noqa: E402
 
 SERVER_NAME = "abiotic-mod-editor"
-SERVER_VERSION = "2.3.3"
+SERVER_VERSION = "2.4.0"
 
 EDITOR_ROOT = paths.find_editor_root()          # None when no Mod Editor install was found
 EDITOR_EXE = paths.editor_exe(EDITOR_ROOT)
@@ -1281,6 +1281,41 @@ def graph_point(win, widget=False):
     return int((r - l) * (0.80 if widget else 0.68)), int((b - t) * 0.40)
 
 
+GRAPH_GREYS = ((34, 40), (49, 55))      # the graph's base and grid-line greys; the panels around it are darker, nodes and text boxes lighter
+
+
+def is_graph_background(rgb):
+    r, g, b = rgb
+    return r == g == b and any(lo <= r <= hi for lo, hi in GRAPH_GREYS)
+
+
+def empty_graph_point(win, widget=False, radius=20):
+    """(x, y, how): a window pixel on empty graph, found by looking at the window. The usual point when only the grid
+    is drawn around it, else the nearest spot in the graph panel that shows only the grid. A paste centres its nodes
+    on the click, so after one the usual point is often under a node, or under a pin's text box, which would take the
+    next paste as text. how: 'usual', 'found', or 'none' (nothing empty seen: the usual point, and the read-back decides)."""
+    x0, y0 = graph_point(win, widget)
+    try:
+        raw, w, h = wininput.pixels(win)
+    except wininput.WinError:
+        return x0, y0, "unchecked"
+
+    def empty(x, y):
+        if not (radius <= x < w - radius and radius <= y < h - radius):
+            return False
+        return all(is_graph_background(wininput.pixel(raw, w, xx, yy))
+                   for yy in range(y - radius, y + radius + 1, 4) for xx in range(x - radius, x + radius + 1, 4))
+
+    if empty(x0, y0):
+        return x0, y0, "usual"
+    spots = [(int(w * fx / 100), int(h * fy / 100)) for fy in range(24, 81, 7) for fx in range(22, 75, 4)]
+    spots.sort(key=lambda p: (p[0] - x0) ** 2 + (p[1] - y0) ** 2)
+    for x, y in spots:
+        if empty(x, y):
+            return x, y, "found"
+    return x0, y0, "none"
+
+
 def show_event_graph(win, widget=False):
     """A new Blueprint opens on its Viewport tab and a widget on its Designer, so bring the graph forward. These are
     positions in the default layout. A click up there can't change anything, and callers check by reading the Blueprint back."""
@@ -1319,6 +1354,8 @@ def new_dialogs(before):
     return sorted(window_titles() - before - {"Message Log"})
 
 
+HAS_CUSTOM_EVENT = re.compile(r"Class=\S*K2Node_CustomEvent ")
+
 DIALOG_OPEN = ("The paste opened a dialog, which blocks the editor until it's answered. Read it with editor_screenshot, then close it with "
                "close_editor_window. A call to a function the Blueprint doesn't have does this: paste and compile the function first.")
 NOTHING_ARRIVED = ("None of the nodes arrived, even with the Event Graph brought forward. Check the window with editor_screenshot: a graph has to be "
@@ -1343,27 +1380,35 @@ def paste_checked(text, asset=None, win=None, xy=None, clear=False, settle=3.0, 
         win, widget = win or opened, info["widget"]
     elif win is None:
         win = wininput.find_window()
-    x, y = xy or graph_point(win, widget)
-    report.update(window=win["title"], at=[x, y])
+    def spot():
+        """Where to click: the given point, else empty graph found by looking at the window, looked for afresh each
+        time (the graph may have been brought forward, or cleared, since the last look)."""
+        if xy:
+            return xy
+        px, py, how = empty_graph_point(win, widget)
+        report["at"], report["spot"] = [px, py], how
+        return px, py
+
+    report.update(window=win["title"], at=list(xy) if xy else None)
     if not asset:
         if clear:
             report.update(ok=False, pasted=False, note="clear needs asset_path: without it, nothing can confirm a graph has focus before Ctrl+A and Delete.")
             return report, True
-        paste_into(win, text, x, y, settle=settle)
+        paste_into(win, text, *spot(), settle=settle)
         report.update(ok=None, pasted=True, verified=False, note="Pasted but not checked: pass asset_path so the result can be read back.")
         return report, False
 
     def attempt(body, wait):
         """Paste and read back. If nothing arrived the graph wasn't showing, so bring it forward once and try again."""
         titles = window_titles()
-        paste_into(win, body, x, y, settle=wait)
+        paste_into(win, body, *spot(), settle=wait)
         dialogs = new_dialogs(titles)
         if dialogs:
             return {"nodes_found": 0, "ok": False, "dialogs": dialogs}
         result = graphbuild.verify(body, export_mod_t3d(asset))
         if not result["nodes_found"] and not xy:
             show_event_graph(win, widget)
-            paste_into(win, body, x, y, settle=wait)
+            paste_into(win, body, *spot(), settle=wait)
             result = graphbuild.verify(body, export_mod_t3d(asset))
             result["brought_graph_forward"] = True
         return result
@@ -1379,6 +1424,10 @@ def paste_checked(text, asset=None, win=None, xy=None, clear=False, settle=3.0, 
         time.sleep(0.6)
         wininput.keys("delete")
         time.sleep(0.8)
+        if HAS_CUSTOM_EVENT.search(text):
+            # The deleted custom events' functions stay in the compiled class until a compile, and a pasted custom event
+            # whose name is taken gets renamed. Compile the emptied graph first; errors are expected and nothing is saved.
+            report["compile_after_clear"] = compile_blueprint(asset, save=False)
     result = attempt(text, settle)
     report.update(result, pasted=True, chars=len(text))
     if result.get("dialogs"):
@@ -1400,6 +1449,80 @@ def paste_checked(text, asset=None, win=None, xy=None, clear=False, settle=3.0, 
     if not result["nodes_found"]:
         report["hint"] = NOTHING_ARRIVED
     is_error = not result["ok"]
+    if compile_it and result["ok"]:
+        c = compile_blueprint(asset, save)
+        report["compile"] = c
+        is_error = not c.get("ok")
+        if not c.get("ok"):
+            report["compile_node_problems"] = t3d_errors(export_mod_t3d(asset))["problems"]
+    return report, is_error
+
+
+def merge_checked(text, asset, graph, settle=3.0, compile_it=False, save=True):
+    """Clear one graph of a Blueprint and paste text that holds its existing nodes plus new ones. Nothing is deleted
+    until a marker paste proves that graph has focus. (report, is_error)"""
+    text, _ = graphbuild.ensure_end_comment(text)
+    check = graphbuild.lint(text)
+    report = {"graph": graph, "lint_warnings": check["warnings"]}
+    if check["errors"]:
+        report.update(ok=False, pasted=False, lint_errors=check["errors"])
+        return report, True
+    win, info = open_asset_window(asset)
+    widget = info["widget"]
+    report.update(window=win["title"])
+
+    def land(body, wait):
+        titles = window_titles()
+        px, py, how = empty_graph_point(win, widget)
+        report["at"], report["spot"] = [px, py], how
+        paste_into(win, body, px, py, settle=wait)
+        dialogs = new_dialogs(titles)
+        if dialogs:
+            return {"nodes_found": 0, "landed_in": {}, "dialogs": dialogs, "ok": False}
+        return graphbuild.verify(body, export_mod_t3d(asset))
+
+    marker = land(graphbuild.comment_block(), 1.0)
+    if not marker["nodes_found"] and not marker.get("dialogs") and graph == "EventGraph":
+        show_event_graph(win, widget)
+        marker = land(graphbuild.comment_block(), 1.0)
+        report["brought_graph_forward"] = True
+    if marker.get("dialogs"):
+        report.update(ok=False, pasted=False, dialogs=marker["dialogs"], hint=DIALOG_OPEN)
+        return report, True
+    showing = next(iter(marker["landed_in"]), None)
+    if not showing:
+        report.update(ok=False, pasted=False, hint=NOTHING_ARRIVED)
+        return report, True
+    if showing != graph:
+        report.update(ok=False, pasted=False, showing=showing,
+                      note=f"{showing} is showing, not {graph}, so nothing was changed. Open the {graph} tab and try again "
+                           f"(the marker comment that landed in {showing} can be deleted).")
+        return report, True
+    # The marker landed in the graph asked for, so Ctrl+A and Delete act on it, not on components.
+    wininput.keys("ctrl+a")
+    time.sleep(0.6)
+    wininput.keys("delete")
+    time.sleep(0.8)
+    report["cleared"] = graph
+    if HAS_CUSTOM_EVENT.search(text):
+        # The functions of the custom events just deleted stay in the compiled class until a compile, and a pasted custom
+        # event whose name is taken gets renamed. Compile the emptied graph first; its errors are expected and nothing is saved.
+        report["compile_after_clear"] = compile_blueprint(asset, save=False)
+    count = len(re.findall(r"^\s*Begin Object ", text, re.M))
+    result = land(text, max(settle, 1.0 + 0.02 * count))
+    report.update(result, pasted=True, chars=len(text))
+    if result.get("dialogs"):
+        report.update(verified=False, hint=DIALOG_OPEN)
+        return report, True
+    report["verified"] = True
+    if result["pure_nodes"]:
+        report["lint_warnings"] = check["warnings"] + [
+            f"{', '.join(result['pure_nodes'])}: a pure node has no exec pins, so the editor took off the ones in this text and joined the chain "
+            "around it (joined_links). That graph is right. Leave those pins out next time."]
+    is_error = not result["ok"]
+    if not result["ok"]:
+        report["hint"] = ("Part of the graph didn't come back. The backup named in the build_graph report holds the old nodes as clipboard "
+                          "text: paste_graph with that file, asset_path and clear=true restores them.")
     if compile_it and result["ok"]:
         c = compile_blueprint(asset, save)
         report["compile"] = c
@@ -1493,7 +1616,7 @@ def probe_nodes(nodes, parent_asset=None, parent_class=None):
         text, _ = graphbuild.ensure_end_comment(graphbuild.bare_text(items))
         titles = window_titles()
         # Clearing removes the default events: a pasted copy of one would turn into a custom event.
-        paste_into(win, text, *graph_point(win, info["widget"]), clear=True, settle=1.5 + len(items) * 0.03)
+        paste_into(win, text, *empty_graph_point(win, info["widget"])[:2], clear=True, settle=1.5 + len(items) * 0.03)
         dialogs = new_dialogs(titles)
         if dialogs:
             removable = False       # deleting behind a dialog crashes the editor; the probe isn't saved, so it can stay
@@ -1609,21 +1732,29 @@ def t_build_graph(args):
     if args.get("spec_file"):
         spec = json.loads(Path(args["spec_file"]).read_text(encoding="utf-8-sig"))
     links = args.get("links") or spec.get("links") or []
-    if not (args.get("nodes") or spec.get("nodes")):
+    spec_nodes = args.get("nodes") or spec.get("nodes") or []
+    merge = bool(args.get("merge", spec.get("merge")))
+    graph = args.get("graph") or spec.get("graph") or "EventGraph"
+    asset = args.get("asset_path") or spec.get("asset_path")
+    if not spec_nodes and not merge:
         return "Pass nodes (and links), or spec_file: a JSON file holding both.", True
-    if args.get("paste") and not args.get("asset_path"):
-        return "paste=true needs asset_path, the Blueprint to paste into.", True
+    if (args.get("paste") or merge) and not asset:
+        return "paste=true and merge=true need asset_path, the Blueprint to paste into.", True
     prefix = args.get("prefix") or "G" + format(int(time.time()) % 36 ** 6, "x").upper()
     try:
-        nodes = named_nodes(args.get("nodes") or spec.get("nodes"), args.get("asset_path"))
+        nodes = named_nodes(spec_nodes, asset)
         for n in nodes:
             graphbuild.describe(n)
+        existing = graphbuild.existing_nodes(bpscan.parse_t3d(export_mod_t3d(asset), keep_body=True), graph) if merge else None
     except graphbuild.SpecError as e:
         return str(e), True
-    templates, probed = templates_for(nodes, args.get("asset_path"), args.get("parent_class"))
-    built = graphbuild.assemble(nodes, links, templates, prefix)
+    templates, probed = templates_for(nodes, asset, args.get("parent_class"))
+    built = graphbuild.assemble(nodes, links, templates, prefix, existing=existing)
     report = {"prefix": prefix, "nodes": len(nodes), "links": built["links"], "asked_editor_for": probed,
               "problems": built["problems"], "warnings": built["warnings"]}
+    if merge:
+        report["merge"] = {"graph": graph, "existing_nodes": len(existing["paste"]), "kept_nodes": [n["name"] for n in existing["kept"]],
+                           "renamed": built["renamed"], "links_to_rewire": built["rewire"]}
     if built["problems"]:
         report["ok"] = False
         return json.dumps(report, indent=2), True
@@ -1631,6 +1762,13 @@ def t_build_graph(args):
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(built["text"], encoding="utf-8")
     report.update(file=str(out), node_names=built["names"])
+    if merge and existing["paste"]:
+        # The old nodes as clipboard text, under names of their own: what paste_graph with clear puts back if the merge goes wrong.
+        backup = HERE / "exports" / "merge" / f"{prefix}-before.t3d"
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_text(graphbuild.assemble([], [], {}, prefix + "B", existing=existing)["text"], encoding="utf-8")
+        report["merge"]["backup"] = str(backup)
+        report["merge"]["restore"] = f"paste_graph(file=<backup>, asset_path='{asset}', clear=true) with the {graph} tab showing"
     try:
         report["blocked_by_upload_filter"] = blocked_calls(built["text"])
     except RemoteError as e:                 # the graph is still good; only this check is missing
@@ -1638,9 +1776,15 @@ def t_build_graph(args):
         report["filter_note"] = f"Couldn't ask the editor about the upload filter: {e}"
     if not args.get("paste"):
         report["ok"] = True
+        if merge:
+            report["merge"]["dry_run"] = "Nothing in the editor was changed. Pass paste=true to clear the graph and paste this text."
         return json.dumps(report, indent=2), False
-    pasted, is_error = paste_checked(built["text"], args["asset_path"], clear=bool(args.get("clear")),
-                                     compile_it=bool(args.get("compile")), save=args.get("save", True))
+    settle = float(args.get("settle_seconds", 3))
+    if merge:
+        pasted, is_error = merge_checked(built["text"], asset, graph, settle, bool(args.get("compile")), args.get("save", True))
+    else:
+        pasted, is_error = paste_checked(built["text"], asset, clear=bool(args.get("clear")), settle=settle,
+                                         compile_it=bool(args.get("compile")), save=args.get("save", True))
     report["paste"] = pasted
     report["ok"] = not is_error
     return json.dumps(report, indent=2), is_error
@@ -1906,9 +2050,14 @@ TOOLS = [
      "sequence {outputs?}; self; make_array {count, element}; make_struct / break_struct {struct}; foreach {element}; input_action {name, consume?}; "
      "spawn_actor / add_component {class}; create_delegate {function}; comment {text, width?, height?}; raw {kind, props? (['Key=Value'] lines or {Key: Value}, values written as given), pins?}.\n"
      "links: [['a.then', 'b.execute'], ['c.ReturnValue', 'd.InString']]. Exec pins are usually execute/then; see discover_pins. "
-     "Links can't reach nodes already in the graph. spec_file: JSON file with nodes and links, for big graphs.",
+     "A paste can't link to nodes already in the graph: merge=true (needs asset_path; paste=true applies it, otherwise a dry run) re-pastes the "
+     "graph's existing nodes together with the new ones after clearing it, so a link may name an existing node by the name inspect_blueprint shows, "
+     "e.g. ['K2Node_CustomEvent_3.then', 'say.execute']. Existing nodes come back under new names (merge.renamed) with their links and positions; "
+     "a backup of them as clipboard text is written first. A function's entry/result nodes can't be re-pasted: links to them are listed under "
+     "merge.links_to_rewire. graph (default EventGraph) must be the tab showing; nothing is deleted until a marker paste proves it is. "
+     "spec_file: JSON file with nodes and links (and merge/graph/asset_path), for big graphs.",
      S(nodes={"type": "array", "items": OBJ}, links={"type": "array", "items": {"type": "array", "items": STR}}, spec_file=STR, asset_path=STR,
-       parent_class=STR, prefix=STR, out_file=STR, paste=BOOL, clear=BOOL, compile=BOOL, save=BOOL), []),
+       parent_class=STR, prefix=STR, out_file=STR, paste=BOOL, clear=BOOL, compile=BOOL, save=BOOL, merge=BOOL, graph=STR, settle_seconds=NUM), []),
     ("play_in_editor", t_play_in_editor,
      "Start (Alt+P in the main window) or stop Play In Editor. Load a real map first (e.g. /Game/Maps/Facility); close the Message Log first.",
      S(action={"type": "string", "enum": ["start", "stop"]}, wait_seconds=NUM), []),
@@ -1957,7 +2106,7 @@ INSTRUCTIONS = (
     "Tools for the official Abiotic Factor Mod Editor (custom Unreal 5.4.4 cooked editor, Python 3.11). Start with editor_status. "
     "Mods are plugins with an AbioticModConfig and per-row assets (e.g. /<Mod>/DataTables/ItemTable_Gear/<Row>) whose data is the 'row' property. "
     "Never edit or save /Game (base content); never T3D-export /Game Blueprints (crash); never delete many assets in one loop (crash). "
-    "Python cannot create Blueprint nodes: use build_graph (it checks every pin against the editor), which pastes and verifies; "
+    "Python cannot create Blueprint nodes: use build_graph (it checks every pin against the editor), which pastes and verifies (merge=true links new nodes to a graph's existing ones); "
     "paste_graph takes T3D you already have. compile_blueprint reports compiler errors. "
     "Copied game Blueprints must pass the upload Asset Audit (Blueprint filter) and the cloud cook; run check_upload before an upload. "
     "Screenshots are per editor window only. The user does mod.io uploads."
