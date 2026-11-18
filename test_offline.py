@@ -5,9 +5,14 @@
 
 import codecs
 import json
+import os
+import re
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -920,6 +925,618 @@ class Merging(unittest.TestCase):
         r = graphbuild.assemble(NODES, LINKS, TEMPLATES, "T1")
         self.assertEqual((r["renamed"], r["rewire"], r["problems"]), ({}, [], []))
         self.assertEqual([n["name"] for n in bpscan.parse_t3d(r["text"])["nodes"]], ["T1_0", "T1_1"])
+
+
+# ---- 2.7.0: keys, event names, numbered packages, and the guards -------------------------------
+
+class FastClock:
+    """`time` for a function under test: sleeping moves the clock on instead of waiting."""
+
+    def __init__(self):
+        self.now = time.time()
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+class Keys(unittest.TestCase):
+    def test_punctuation_is_its_own_key_not_its_character_code(self):
+        import wininput
+        self.assertEqual(wininput.key_codes("."), [0xBE])
+        self.assertEqual(wininput.key_codes("["), [0xDB])
+        self.assertEqual(wininput.key_codes("\\"), [0xDC])
+        self.assertEqual(wininput.key_codes("ctrl+-"), [0x11, 0xBD])
+        self.assertEqual(wininput.key_codes("ctrl+shift+s"), [0x11, 0x10, ord("S")])
+        self.assertEqual(wininput.key_codes("Delete"), [0x2E])
+        self.assertEqual(wininput.key_codes("period"), wininput.key_codes("."))
+        # What the character codes of these would press: Delete, Insert, PrintScreen, Help, Right, both Windows keys, Apps, Numpad 0.
+        wrong = {0x2E, 0x2D, 0x2C, 0x2F, 0x27, 0x5B, 0x5C, 0x5D, 0x60}
+        for ch in ";=,-./`[\\]'":
+            self.assertFalse(wrong & set(wininput.key_codes(ch)), ch)
+
+    def test_unknown_keys_are_refused(self):
+        import wininput
+        for bad in ("ctrl++", "é", "!", "enterr", ""):
+            with self.assertRaises(wininput.WinError, msg=bad):
+                wininput.key_codes(bad)
+
+    def test_keys_reach_only_the_window_expected(self):
+        import wininput
+        sent = []
+
+        class Keyboard:
+            def keybd_event(self, vk, scan, flags, extra):
+                sent.append(vk)
+
+        saved = (wininput.user32, wininput.foreground, wininput.foreground_is_editor)
+        wininput.user32, wininput.foreground_is_editor = Keyboard(), (lambda: True)
+        wininput.foreground = lambda: {"hwnd": 7, "title": "Facility - Unreal Editor", "editor": True}
+        try:
+            with self.assertRaises(wininput.WinError) as refused:
+                wininput.keys("delete", 0, expect={"hwnd": 9, "title": "BP_Thing"})
+            self.assertIn("Facility - Unreal Editor", str(refused.exception))
+            self.assertEqual(sent, [])
+            wininput.keys("delete", 0, expect={"hwnd": 7, "title": "Facility - Unreal Editor"})
+            self.assertEqual(sent, [0x2E, 0x2E])                    # down, up
+            wininput.keys("a", 0)                                   # no window named: any editor window will do
+            wininput.keys("down", 0, expect={"hwnd": 3, "title": "<popup 1>", "popup": True})   # a menu never has the focus
+            wininput.foreground_is_editor = lambda: False
+            with self.assertRaises(wininput.WinError):
+                wininput.keys("a", 0)
+        finally:
+            wininput.user32, wininput.foreground, wininput.foreground_is_editor = saved
+
+
+def event_text(name="Charge", node="N_0"):
+    return "\n".join([f'Begin Object Class=/Script/BlueprintGraph.K2Node_CustomEvent Name="{node}"', f'CustomFunctionName="{name}"',
+                      "NodePosX=0", "NodePosY=0", pin("C1", "then", out=True), "End Object", ""])
+
+
+class EventNames(unittest.TestCase):
+    def test_a_probe_pastes_a_custom_event_under_its_own_name(self):
+        spec = {"id": "e", "type": "custom_event", "name": "Charge", "params": [{"name": "Amount", "cat": "float"}]}
+        text = graphbuild.bare_text([("McpProbeAB_0", spec)])
+        self.assertIn('CustomFunctionName="McpProbeAB_0"', text)
+        self.assertNotIn("Charge", text)
+        self.assertIn('PinName="Amount"', text)
+        self.assertEqual(spec["name"], "Charge")
+        raw = {"id": "r", "type": "raw", "kind": "K2Node_CustomEvent", "props": ['CustomFunctionName="Pulse"', "bCommentBubbleVisible=False"]}
+        text = graphbuild.bare_text([("McpProbeAB_1", raw)])
+        self.assertIn('CustomFunctionName="McpProbeAB_1"', text)
+        self.assertIn("bCommentBubbleVisible=False", text)
+        self.assertEqual(raw["props"][0], 'CustomFunctionName="Pulse"')
+        as_dict = dict(raw, props={"CustomFunctionName": '"Pulse"'})
+        self.assertIn('CustomFunctionName="McpProbeAB_2"', graphbuild.bare_text([("McpProbeAB_2", as_dict)]))
+        call = {"id": "c", "owner": "/Script/Engine.KismetSystemLibrary", "function": "PrintString"}
+        self.assertIs(graphbuild.probe_copy(call, "X"), call)
+
+    def test_the_spec_names_the_event_whatever_the_probe_called_it(self):
+        node = {"id": "ev", "type": "custom_event", "name": "Charge"}
+        tpl = {"class": "K2Node_CustomEvent", "error": None, "props": ['CustomFunctionName="McpProbeAB_0"', "bOverrideFunction=False"],
+               "pins": [full_pin("OutputDelegate", "delegate", out=True), full_pin("then", out=True)]}
+        text = graphbuild.assemble([node], [], {"ev": tpl}, "T")["text"]
+        self.assertIn('CustomFunctionName="Charge"', text)
+        self.assertNotIn("McpProbeAB_0", text)
+        self.assertEqual(text.count("CustomFunctionName="), 1)
+        self.assertIn("bOverrideFunction=False", text)          # what else the editor gave the node stays
+
+    def test_a_renamed_event_fails_the_check(self):
+        r = graphbuild.verify(event_text("Charge"), event_text("CustomEvent"))
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["renamed_events"], [{"node": "N_0", "sent": "Charge", "now": "CustomEvent"}])
+        self.assertIn("Charge (now CustomEvent)", graphbuild.renamed_event_hint(r))
+        same = graphbuild.verify(event_text("Charge"), event_text("Charge"))
+        self.assertTrue(same["ok"])
+        self.assertIsNone(graphbuild.renamed_event_hint(same))
+
+    def test_an_enum_parameter_is_written_as_an_enum(self):
+        enum = graphbuild._user_pin({"name": "Mode", "cat": "byte", "obj": "/Script/Engine.ECollisionChannel"})
+        self.assertIn("/Script/CoreUObject.Enum'/Script/Engine.ECollisionChannel'", enum)
+        self.assertIn("ScriptStruct'/Script/CoreUObject.Vector'", graphbuild._user_pin({"name": "At", "cat": "struct", "obj": "/Script/CoreUObject.Vector"}))
+        self.assertIn("CoreUObject.Class'/Script/Engine.Actor'", graphbuild._user_pin({"name": "Who", "cat": "object", "obj": "/Script/Engine.Actor"}))
+        wild = 'PinId=AA,PinName="Element",PinType.PinCategory="wildcard",PinType.PinSubCategory="",PinType.PinSubCategoryObject=None,'
+        self.assertIn("CoreUObject.Enum'/Script/Engine.ECollisionChannel'", graphbuild._retype(wild, {"cat": "byte", "obj": "/Script/Engine.ECollisionChannel"}))
+
+
+class NumberedNames(unittest.TestCase):
+    def test_a_numbered_package_is_found_by_the_part_before_its_number(self):
+        import server
+        retail = {"AbioticFactor/Content/Tex/T_Noise_1.uasset", "AbioticFactor/Content/Tex/T_Plain.uasset",
+                  "AbioticFactor/Content/Tex/T_Both_2.uasset", "AbioticFactor/Content/Tex/T_Padded_01.uasset"}
+        editor = retail | {"AbioticFactor/Content/Dev/T_Debug_3.uasset", "AbioticFactor/Content/Tex/T_Both.uasset"}
+        saved, kept = server.asset_list, dict(server._NUMBERED)
+        server.asset_list = lambda name: retail if name == "retail" else editor
+        server._NUMBERED.clear()
+        try:
+            self.assertEqual(sorted(server.numbered_packages("retail")), ["AbioticFactor/Content/Tex/T_Both", "AbioticFactor/Content/Tex/T_Noise"])
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / "Mine.uplugin").write_text(json.dumps({"FriendlyName": "Mine", "VersionName": "1.0"}), encoding="utf-8")
+                (root / "Content").mkdir()
+                (root / "Content" / "M_Thing.uasset").write_bytes(
+                    b"\x00/Game/Tex/T_Noise\x00/Game/Dev/T_Debug\x00/Game/Tex/T_Both\x00/Game/Tex/T_Nowhere\x00/Game/Tex/T_Padded_01\x00")
+                r = server.check_upload(root)
+            said = r["errors"] + r["warnings"]
+            self.assertFalse(any("T_Noise" in line or "T_Padded" in line for line in said), r)
+            self.assertTrue(any("T_Debug" in line and "/Game/Dev/T_Debug_3" in line and "only in the editor" in line for line in r["errors"]), r)
+            self.assertTrue(any("T_Both" in line and "either" in line and "/Game/Tex/T_Both_2" in line for line in r["warnings"]), r)
+            self.assertTrue(any("T_Nowhere" in line and "not in the retail or editor" in line for line in r["warnings"]), r)
+            self.assertEqual(r["verdict"], "FAIL")
+        finally:
+            server.asset_list = saved
+            server._NUMBERED.clear()
+            server._NUMBERED.update(kept)
+
+
+def log_line(seconds_ago, text, now=None):
+    stamp = time.strftime("%Y.%m.%d-%H.%M.%S", time.gmtime((now or time.time()) - seconds_ago))
+    return f"[{stamp}:000][  1]{text}"
+
+
+class Closing(unittest.TestCase):
+    """close_editor against a fake editor: which windows it has, what its log says, whether it answers."""
+
+    CLEAN = {"dirty_packages": {"content": [], "maps": []}, "open_mods": [{"root": "/MyMod"}]}
+    MAIN = "Facility - Unreal Editor"
+
+    def setUp(self):
+        import server
+        import wininput
+        self.s, self.w = server, wininput
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = Path(self.tmp.name) / "AbioticFactor.log"
+        self.saved = (wininput.editor_windows, wininput.close_main_window, wininput.close_window, wininput.editor_pids,
+                      server.run_json, server.log_file, server.time)
+        server.time = FastClock()
+        server.log_file = lambda name=None: self.log
+        self.sent = []
+
+    def tearDown(self):
+        (self.w.editor_windows, self.w.close_main_window, self.w.close_window, self.w.editor_pids,
+         self.s.run_json, self.s.log_file, self.s.time) = self.saved
+        self.tmp.cleanup()
+
+    def editor(self, titles, new=(), status=None):
+        """These windows until the main one is asked to close; then `new` ones join them; with no new one it is gone
+        after a few looks. With no window at all it is already on its way out."""
+        state = {"looks": 0, "closing": not titles}
+
+        def gone():
+            return not new and state["closing"] and state["looks"] > 2
+
+        def window(hwnd, title):
+            return {"hwnd": hwnd, "title": title, "pid": 1, "rect": [0, 0, 1600, 900], "minimized": False}
+
+        def windows(popups=False):
+            if state["closing"]:
+                state["looks"] += 1
+            if gone():
+                return []
+            return ([window(10 + i, t) for i, t in enumerate(titles)]
+                    + ([window(90 + i, t) for i, t in enumerate(new)] if state["closing"] else []))
+
+        def asked(*a, **k):
+            if isinstance(status, Exception):
+                raise status
+            return status or self.CLEAN
+
+        self.w.editor_windows = windows
+        self.w.close_main_window = lambda w: (self.sent.append(w["title"]), state.update(closing=True))
+        self.w.close_window = lambda w: self.sent.append("close " + w["title"])
+        self.w.editor_pids = lambda: [] if gone() else [1]
+        self.s.run_json = asked
+
+    def test_closes_when_nothing_is_in_the_way(self):
+        self.editor([self.MAIN])
+        r = self.s.close_editor(wait=30)
+        self.assertTrue(r["closed"], r)
+        self.assertEqual(self.sent, [self.MAIN])
+
+    def test_an_open_upload_window_keeps_it_open(self):
+        self.editor([self.MAIN, "Upload Mod"])
+        r = self.s.close_editor(wait=30)
+        self.assertFalse(r["closed"])
+        self.assertIn("Upload Mod window", r["error"])
+        self.assertEqual(self.sent, [])
+
+    def test_an_upload_in_the_log_keeps_it_open_until_it_ends(self):
+        self.editor([self.MAIN])
+        self.log.write_text("\n".join([log_line(400, "LogModio: Uploaded with status 0"),
+                                       log_line(20, "LogModio: Display: Beginning submission of mod source 1234567"),
+                                       log_line(5, "LogHttp: something else")]) + "\n", encoding="utf-8")
+        r = self.s.close_editor(wait=30)
+        self.assertFalse(r["closed"])
+        self.assertIn("upload that began", r["error"])
+        self.assertEqual(self.sent, [])
+        with open(self.log, "a", encoding="utf-8") as f:
+            f.write(log_line(1, "LogModio: ModManagementEvent Uploaded with status 0") + "\n")
+        self.assertTrue(self.s.close_editor(wait=30)["closed"])
+
+    def test_an_upload_begun_long_ago_does_not_count(self):
+        self.editor([self.MAIN])
+        self.log.write_text(log_line(2 * 3600, "LogModio: Display: Beginning submission of mod source 1") + "\n", encoding="utf-8")
+        self.assertTrue(self.s.close_editor(wait=30)["closed"])
+
+    def test_force_closes_during_an_upload(self):
+        self.editor([self.MAIN, "Upload Mod"])
+        self.assertTrue(self.s.close_editor(wait=30, force=True)["closed"])
+        self.assertEqual(self.sent, [self.MAIN])
+
+    def test_an_editor_that_does_not_answer_is_left_open(self):
+        self.editor([self.MAIN], status=self.s.RemoteError("no editor answered"))
+        r = self.s.close_editor(wait=30)
+        self.assertFalse(r["closed"])
+        self.assertIn("isn't answering", r["error"])
+        self.assertEqual(self.sent, [])
+        forced = self.s.close_editor(wait=30, force=True)
+        self.assertTrue(forced["closed"], forced)
+        self.assertIn("closing anyway", forced["note"])
+
+    def test_unsaved_packages_are_never_forced(self):
+        self.editor([self.MAIN], status={"dirty_packages": {"content": ["/MyMod/BP_X"], "maps": []}, "open_mods": []})
+        r = self.s.close_editor(wait=30, force=True)
+        self.assertFalse(r["closed"])
+        self.assertIn("Unsaved packages", r["error"])
+        self.assertEqual(self.sent, [])
+
+    def test_an_editor_already_on_its_way_out_is_waited_for(self):
+        self.editor([], status=self.s.RemoteError("no editor answered"))
+        r = self.s.close_editor(wait=30)
+        self.assertTrue(r["closed"], r)
+        self.assertEqual(self.sent, [])
+
+    def test_a_window_with_save_in_its_name_is_not_a_save_dialog(self):
+        self.editor([self.MAIN, "BP_SaveStation", "SaveSlotWidget"])
+        r = self.s.close_editor(wait=30)
+        self.assertTrue(r["closed"], r)
+
+    def test_a_save_dialog_that_opens_stops_the_close(self):
+        self.editor([self.MAIN], new=["Save Content"])
+        r = self.s.close_editor(wait=30)
+        self.assertFalse(r["closed"])
+        self.assertEqual(r["dialog"], "Save Content")
+
+    def test_upload_in_progress_reads_the_newest_line(self):
+        now = time.time()
+        self.log.write_text(log_line(50, "LogModio: Beginning submission of mod 7", now) + "\n", encoding="utf-8")
+        self.assertIn("50 s ago", self.s.upload_in_progress([], now))
+        self.assertIsNone(self.s.upload_in_progress([], now + self.s.UPLOAD_WINDOW))
+        self.log.write_text(log_line(50, "LogModio: Beginning submission of mod 7", now) + "\n"
+                            + log_line(9, "LogModio: Mod upload canceled", now) + "\n", encoding="utf-8")
+        self.assertIsNone(self.s.upload_in_progress([], now))
+        self.log.unlink()
+        self.assertIsNone(self.s.upload_in_progress([], now))
+
+
+def blueprint_export(graphs):
+    """A Blueprint export holding {graph: [(class path, node name, [body lines])]}: declarations, then definitions."""
+    lines = ['Begin Object Class=/Script/Engine.Blueprint Name="BP_T" ExportPath="x"']
+    for graph, nodes in graphs.items():
+        lines.append(f'   Begin Object Class=/Script/Engine.EdGraph Name="{graph}" ExportPath="x"')
+        for cls, name, _ in nodes:
+            lines += [f'      Begin Object Class={cls} Name="{name}" ExportPath="x"', "      End Object"]
+        lines.append("   End Object")
+    for graph, nodes in graphs.items():
+        lines.append(f'   Begin Object Name="{graph}" ExportPath="x"')
+        for cls, name, body in nodes:
+            lines += [f'      Begin Object Name="{name}" ExportPath="x"'] + ["         " + b for b in body] + ["      End Object"]
+        lines += [f"      Nodes({i})=\"{cls}'{name}'\"" for i, (cls, name, _) in enumerate(nodes)]
+        lines.append("   End Object")
+    lines.append("   UbergraphPages(0)=\"/Script/Engine.EdGraph'EventGraph'\"")
+    lines += [f"   FunctionGraphs({i})=\"/Script/Engine.EdGraph'{g}'\"" for i, g in enumerate(g for g in graphs if g != "EventGraph")]
+    return "\n".join(lines + ["End Object"])
+
+
+class ClearingGraphs(unittest.TestCase):
+    """paste_checked against a fake Blueprint window: a paste lands in the graph tab that is showing."""
+
+    BG = "/Script/BlueprintGraph."
+
+    def setUp(self):
+        import server
+        self.s = server
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.file = root / "BP_T.uasset"
+        self.file.write_bytes(b"saved state")
+        self.graphs = {"EventGraph": [(self.BG + "K2Node_Event", "OLD_0", ['EventReference=(MemberName="ReceiveBeginPlay")', "NodePosX=0", "NodePosY=0"])],
+                       "Fn": [(self.BG + "K2Node_FunctionEntry", "FE_0", []), (self.BG + "K2Node_CallFunction", "FC_1", ["NodePosX=300", "NodePosY=0"])]}
+        self.showing, self.cleared, self.stuck, self.rename = "EventGraph", [], False, False
+        names = ("BACKUPS", "open_asset_window", "window_titles", "empty_graph_point", "paste_into", "clear_showing_graph",
+                 "export_mod_t3d", "compile_blueprint", "editor_memory", "run_json", "show_event_graph")
+        self.saved = {n: getattr(server, n) for n in names}
+        server.BACKUPS = root / "backups"
+        server.open_asset_window = lambda path, wait=20.0: ({"hwnd": 1, "title": "BP_T", "rect": [0, 0, 1600, 900]}, {"widget": False, "name": "BP_T"})
+        server.window_titles = lambda: set()
+        server.empty_graph_point = lambda win, widget=False, radius=20: (100, 100, "usual")
+        server.paste_into = self.paste
+        server.clear_showing_graph = self.clear
+        server.export_mod_t3d = lambda path: blueprint_export(self.graphs)
+        server.compile_blueprint = lambda path, save=True, save_on_error=False: {"ok": True, "errors": [], "warnings": [], "saved": save}
+        server.editor_memory = lambda: {}
+        server.run_json = lambda body, args=None, **kw: {"package": "/M/BP_T", "file": str(self.file), "unsaved": True}
+        server.show_event_graph = lambda win, widget=False: setattr(self, "showing", "EventGraph")
+
+    def tearDown(self):
+        for n, v in self.saved.items():
+            setattr(self.s, n, v)
+        self.tmp.cleanup()
+
+    def paste(self, win, text, x, y, clear=False, settle=3.0):
+        for n in bpscan.parse_t3d(text, keep_body=True)["nodes"]:
+            body = [b.strip() for b in n["body"] if b.strip()]
+            if self.rename:
+                body = [re.sub(r'^CustomFunctionName="[^"]*"', 'CustomFunctionName="CustomEvent"', b) for b in body]
+            self.graphs[self.showing].append((n["class_path"], n["name"], body))
+
+    def clear(self, win):
+        self.cleared.append(self.showing)
+        if not self.stuck:
+            self.graphs[self.showing] = [n for n in self.graphs[self.showing] if n[0].endswith("K2Node_FunctionEntry")]
+
+    def names(self, graph):
+        return [name for _, name, _ in self.graphs[graph] if not name.startswith("McpPasteEnd_")]
+
+    def test_clear_refuses_when_another_graph_is_showing(self):
+        self.showing = "Fn"
+        report, error = self.s.paste_checked(event_text(), "/M/BP_T", clear=True)
+        self.assertTrue(error)
+        self.assertEqual((report["ok"], report["pasted"], report["showing"]), (False, False, "Fn"))
+        self.assertIn("nothing was deleted", report["note"])
+        self.assertEqual(self.cleared, [])
+        self.assertEqual((self.names("Fn"), self.names("EventGraph")), (["FE_0", "FC_1"], ["OLD_0"]))
+
+    def test_clear_empties_the_event_graph_after_copying_it_aside(self):
+        report, error = self.s.paste_checked(event_text(), "/M/BP_T", clear=True)
+        self.assertFalse(error, report)
+        self.assertEqual((report["cleared"], self.cleared), ("EventGraph", ["EventGraph"]))
+        self.assertEqual((self.names("EventGraph"), self.names("Fn")), (["N_0"], ["FE_0", "FC_1"]))
+        backup = report["backup"]
+        self.assertEqual(Path(backup["file"]).read_bytes(), b"saved state")
+        self.assertIn("unsaved changes", backup["file_note"])
+        self.assertEqual(backup["graph_nodes"], 1)
+        self.assertIn("ReceiveBeginPlay", Path(backup["graph_text"]).read_text(encoding="utf-8"))
+        self.assertIn("restore_asset", backup["restore"])
+        self.assertIn("compile_after_clear", report)
+
+    def test_clear_of_a_named_function_graph(self):
+        self.showing = "Fn"
+        report, error = self.s.paste_checked(event_text(), "/M/BP_T", clear=True, graph="Fn")
+        self.assertFalse(error, report)
+        self.assertEqual(report["cleared"], "Fn")
+        self.assertEqual((self.names("Fn"), self.names("EventGraph")), (["FE_0", "N_0"], ["OLD_0"]))
+
+    def test_a_delete_that_removed_nothing_stops_before_the_paste(self):
+        self.stuck = True
+        report, error = self.s.paste_checked(event_text(), "/M/BP_T", clear=True)
+        self.assertTrue(error)
+        self.assertEqual((report["pasted"], report["not_cleared"]), (False, ["OLD_0"]))
+        self.assertEqual(self.names("EventGraph"), ["OLD_0"])
+
+    def test_a_paste_that_lands_in_another_graph_than_the_one_named(self):
+        self.showing = "Fn"
+        report, error = self.s.paste_checked(event_text(), "/M/BP_T", graph="EventGraph", compile_it=True)
+        self.assertTrue(error)
+        self.assertIn("landed in Fn, not EventGraph", report["hint"])
+        self.assertNotIn("compile", report)
+        plain, error = self.s.paste_checked(event_text(node="N_1"), "/M/BP_T")       # no graph named: where it lands is reported, as before
+        self.assertFalse(error, plain)
+        self.assertEqual(plain["landed_in"], {"Fn": 2})
+
+    def test_old_copies_are_removed(self):
+        folder = self.s.BACKUPS
+        folder.mkdir(parents=True)
+        for i in range(5):
+            f = folder / f"BP_T-{i}.uasset"
+            f.write_bytes(b"x")
+            os.utime(f, (1000 + i, 1000 + i))
+        self.s.prune_backups(keep=2)
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["BP_T-3.uasset", "BP_T-4.uasset"])
+
+    def test_a_renamed_custom_event_is_an_error(self):
+        self.rename = True
+        report, error = self.s.paste_checked(event_text(), "/M/BP_T", compile_it=True)
+        self.assertTrue(error)
+        self.assertEqual(report["renamed_events"], [{"node": "N_0", "sent": "Charge", "now": "CustomEvent"}])
+        self.assertIn("renamed 1 custom event", report["hint"])
+        self.assertNotIn("compile", report)
+
+
+class Worlds(unittest.TestCase):
+    def setUp(self):
+        import server
+        self.s = server
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.saved = (server.WORLDS, server.WORLD_BACKUPS, server.WORLD_AUTO_KEEP, server.editor_process_running, server.run_json)
+        server.WORLDS, server.WORLD_BACKUPS = root / "Editor" / "Worlds", root / "copies"
+        server.editor_process_running = lambda: False
+        self.world = server.WORLDS / "Cascade"
+        (self.world / "Players").mkdir(parents=True)
+        (self.world / "WorldSave_Facility.sav").write_bytes(b"facility 1")
+        (self.world / "Players" / "Player_1.sav").write_bytes(b"player 1")
+
+    def tearDown(self):
+        (self.s.WORLDS, self.s.WORLD_BACKUPS, self.s.WORLD_AUTO_KEEP, self.s.editor_process_running, self.s.run_json) = self.saved
+        self.tmp.cleanup()
+
+    def play(self, n):
+        (self.world / "WorldSave_Facility.sav").write_bytes(b"facility after play %d" % n)
+        (self.world / f"Extra_{n}.sav").write_bytes(b"x")
+
+    def test_backup_then_restore_brings_the_world_back(self):
+        s = self.s
+        first = s.backup_world("Cascade", auto=True)
+        self.assertTrue(first["new"])
+        self.assertEqual((first["files"], first["hash"]), (2, s.folder_hash(self.world)))
+        again = s.backup_world("Cascade", auto=True)
+        self.assertEqual((again["new"], again["name"]), (False, first["name"]))
+        self.assertEqual(s.world_status()["worlds"][0]["same_as_backup"], first["name"])
+        self.play(1)
+        self.assertIsNone(s.world_status("Cascade")["worlds"][0]["same_as_backup"])
+        r = s.restore_world("Cascade", first["name"])
+        self.assertTrue(r["hash_checked"], r)
+        self.assertEqual(s.folder_hash(self.world), first["hash"])
+        self.assertFalse((self.world / "Extra_1.sav").exists())
+        self.assertEqual(sorted(p.name for p in s.WORLDS.parent.iterdir()), ["Worlds"])        # no half-way folders left
+        kept = next(b for b in s.world_backups("Cascade") if b["name"] == r["replaced_state_kept_as"])
+        self.assertEqual((Path(kept["folder"]) / "Extra_1.sav").read_bytes(), b"x")
+        self.assertIn("already equals", s.restore_world("Cascade", first["name"])["note"])
+
+    def test_a_copy_before_play_only_when_the_world_changed(self):
+        s = self.s
+        first = s.auto_backup_worlds()
+        self.assertEqual((first[0]["world"], first[0]["new"], first[0]["note"]), ("Cascade", True, "First copy of this world."))
+        self.assertFalse(s.auto_backup_worlds()[0]["new"])
+        self.play(1)
+        third = s.auto_backup_worlds()[0]
+        self.assertTrue(third["new"])
+        self.assertIn("someone has played", third["note"])
+        self.assertEqual(len(s.world_backups("Cascade")), 2)
+
+    def test_old_automatic_copies_go_and_named_ones_stay(self):
+        s = self.s
+        s.WORLD_AUTO_KEEP = 2
+        named = s.backup_world("Cascade", label="before tests: 0.7!")
+        self.assertEqual(named["name"].split("-", 2)[2], "before-tests-0.7")
+        for n in range(4):
+            self.play(n)
+            s.backup_world("Cascade", auto=True)
+        backups = s.world_backups("Cascade")
+        self.assertEqual(len([b for b in backups if b["auto"]]), 2)
+        self.assertIn(named["name"], [b["name"] for b in backups])
+        self.assertEqual(backups[0]["hash"], s.folder_hash(self.world))        # newest first
+
+    def test_restore_refuses_during_play_and_for_an_unknown_copy(self):
+        s = self.s
+        first = s.backup_world("Cascade")
+        with self.assertRaises(s.RemoteError) as unknown:
+            s.restore_world("Cascade", "nope")
+        self.assertIn(first["name"], str(unknown.exception))
+        self.play(1)
+        s.editor_process_running = lambda: True
+        s.run_json = lambda *a, **k: {"playing": True}
+        with self.assertRaises(s.RemoteError) as playing:
+            s.restore_world("Cascade", first["name"])
+        self.assertIn("Play In Editor is running", str(playing.exception))
+        self.assertTrue((self.world / "Extra_1.sav").exists())
+
+    def test_the_tool(self):
+        s = self.s
+        made = json.loads(s.t_test_world({"action": "backup", "label": "mine"}))
+        self.assertTrue(made["new"])
+        status = json.loads(s.t_test_world({}))
+        self.assertEqual(status["worlds"][0]["backups"][0]["label"], "mine")
+        text, error = s.t_test_world({"action": "restore"})
+        self.assertTrue(error)
+        self.assertIn(made["name"], text)
+
+
+class Sharing(unittest.TestCase):
+    def other_process(self, name):
+        code = (f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent)!r}); import wininput; "
+                f"print(wininput.InputLock({name!r}).acquire(0.2))")
+        return subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120).stdout.strip()
+
+    def test_one_process_drives_at_a_time(self):
+        import wininput
+        name = "Local\\abf-mcp-test-" + uuid.uuid4().hex
+        lock = wininput.InputLock(name)
+        self.assertTrue(lock.acquire(0))
+        self.assertTrue(lock.acquire(0))                # a tool that calls another tool
+        self.assertEqual(self.other_process(name), "False")
+        lock.release()
+        self.assertEqual(self.other_process(name), "False")
+        lock.release()
+        self.assertEqual(self.other_process(name), "True")
+
+    def test_who_drove_last(self):
+        import server
+        saved = server.DRIVER
+        with tempfile.TemporaryDirectory() as d:
+            server.DRIVER = Path(d) / "sub" / "driver.json"
+            try:
+                self.assertIsNone(server.read_driver())
+                server.write_driver("paste_graph", 100.0, 110.0)
+                mine = server.read_driver(now=130.0)
+                self.assertEqual((mine["tool"], mine["seconds_ago"], mine["this_chat"], mine["server_alive"]), ("paste_graph", 20, True, True))
+                self.assertIsNone(server.other_chat_note(mine))
+                other = dict(mine, this_chat=False, server_pid=4242)
+                self.assertIn("process 4242", server.other_chat_note(other))
+                self.assertIsNone(server.other_chat_note(dict(other, server_alive=False)))
+                self.assertIsNone(server.other_chat_note(dict(other, seconds_ago=server.OTHER_CHAT_WINDOW + 1)))
+                self.assertIsNone(server.other_chat_note(None))
+            finally:
+                server.DRIVER = saved
+
+    def test_a_driving_tool_holds_the_lock_and_adds_the_note_as_its_own_item(self):
+        import server
+        import wininput
+        saved = (server.DRIVER, server.LOCK, server.read_driver, dict(server.TOOL_MAP))
+        seen = []
+
+        def click(args):
+            seen.append(server.LOCK.held)
+            if args.get("boom"):
+                raise wininput.WinError("no such window")
+            return json.dumps({"clicked": True})
+
+        with tempfile.TemporaryDirectory() as d:
+            server.DRIVER = Path(d) / "driver.json"
+            server.LOCK = wininput.InputLock("Local\\abf-mcp-test-" + uuid.uuid4().hex)
+            server.TOOL_MAP["editor_click"] = ("editor_click", click, "", {}, [])
+            server.read_driver = lambda now=None: {"server_pid": 4242, "tool": "build_graph", "seconds_ago": 12, "this_chat": False, "server_alive": True}
+            try:
+                out = server.handle({"method": "tools/call", "params": {"name": "editor_click", "arguments": {}}})
+                self.assertEqual(json.loads(out["content"][0]["text"]), {"clicked": True})
+                self.assertIn("another chat's server (process 4242)", out["content"][1]["text"])
+                self.assertEqual((seen, server.LOCK.held), ([1], 0))
+                self.assertEqual(json.loads(server.DRIVER.read_text())["tool"], "editor_click")
+                failed = server.handle({"method": "tools/call", "params": {"name": "editor_click", "arguments": {"boom": True}}})
+                self.assertTrue(failed["isError"])
+                self.assertEqual(server.LOCK.held, 0)
+            finally:
+                server.DRIVER, server.LOCK, server.read_driver = saved[:3]
+                server.TOOL_MAP.clear()
+                server.TOOL_MAP.update(saved[3])
+
+    def test_tool_list(self):
+        import server
+        tools = {t["name"]: t for t in server.handle({"method": "tools/list", "params": {}})["tools"]}
+        self.assertEqual(len(tools), 46)
+        self.assertIn("force", tools["close_editor"]["inputSchema"]["properties"])
+        self.assertIn("graph", tools["paste_graph"]["inputSchema"]["properties"])
+        self.assertIn("backup_world", tools["play_in_editor"]["inputSchema"]["properties"])
+        self.assertEqual(tools["restore_asset"]["inputSchema"]["required"], ["asset_path", "backup_file"])
+        self.assertNotIn("annotations", tools["test_world"])
+        self.assertTrue(server.DRIVING_TOOLS <= set(tools))
+        self.assertFalse(server.DRIVING_TOOLS & server.READ_ONLY_TOOLS)
+
+
+class Memory(unittest.TestCase):
+    def test_when_to_say_restart(self):
+        import server
+        self.assertIsNone(server.memory_note(6.0, 30.0, 48.0))
+        self.assertIn("restart it", server.memory_note(30.0, 12.0, 48.0))
+        self.assertIn("3.0 GB left", server.memory_note(6.0, 3.0, 48.0))
+        self.assertIsNone(server.memory_note(0.0, 3.0, 48.0))          # no editor running
+
+    def test_readers_on_this_process(self):
+        import wininput
+        in_ram, committed = wininput.process_memory(os.getpid())
+        self.assertGreater(in_ram, 1 << 20)
+        self.assertGreater(committed, 1 << 20)
+        limit, free, ram = wininput.system_memory()
+        self.assertGreater(limit, free)
+        self.assertGreater(ram, 1 << 30)
+        self.assertTrue(wininput.pid_alive(os.getpid()))
+        self.assertFalse(wininput.pid_alive(0x7FFFFFF0))
 
 
 if __name__ == "__main__":

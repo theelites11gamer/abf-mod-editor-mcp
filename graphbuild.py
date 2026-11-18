@@ -61,15 +61,24 @@ def _pin_type(cat):
     return cat, ""
 
 
+def _object_kind(cat):
+    """What a pin type's object is, as the editor names it before the path: a class for object-like pins, an enum for a
+    byte or enum pin, else a struct. Written as the wrong kind, the object isn't found and the pin loses its type."""
+    if cat in ("object", "class", "softobject", "softclass", "interface"):
+        return "/Script/CoreUObject.Class"
+    if cat in ("byte", "enum"):
+        return "/Script/CoreUObject.Enum"
+    return "/Script/CoreUObject.ScriptStruct"
+
+
 def _type_text(cat, obj=None):
-    """The inside of a PinType=(...) struct for a category and an optional class or struct path."""
+    """The inside of a PinType=(...) struct for a category and an optional class, struct or enum path."""
     cat, sub = _pin_type(cat)
     text = f'PinCategory="{cat}"'
     if sub:
         text += f',PinSubCategory="{sub}"'
     if obj:
-        kind = "/Script/CoreUObject.Class" if cat in ("object", "class", "softobject", "softclass") else "/Script/CoreUObject.ScriptStruct"
-        text += f",PinSubCategoryObject=\"{kind}'{obj}'\""
+        text += f",PinSubCategoryObject=\"{_object_kind(cat)}'{obj}'\""
     return text
 
 
@@ -80,9 +89,7 @@ def pin_type_fields(cat, obj=None, array=False):
     if sub:
         fields.append(f'PinType.PinSubCategory="{sub}"')
     if obj:
-        kind = ("/Script/CoreUObject.Class" if cat in ("object", "class", "softobject", "softclass")
-                else "/Script/CoreUObject.Enum" if cat in ("byte", "enum") else "/Script/CoreUObject.ScriptStruct")
-        fields.append(f"PinType.PinSubCategoryObject=\"{kind}'{obj}'\"")
+        fields.append(f"PinType.PinSubCategoryObject=\"{_object_kind(cat)}'{obj}'\"")
     if array:
         fields.append("PinType.ContainerType=Array")
     return ",".join(fields) + ","
@@ -205,11 +212,31 @@ def usable_template(t):
     return bool(t) and not t.get("error")
 
 
+EVENT_NAME = re.compile(r'^CustomFunctionName="[^"]*"$')
+# What a node is called is the spec's to say. The editor renames a custom event whose name is taken where it lands, and
+# a probe lands in a child of the Blueprint being built, where every one of that Blueprint's own events is taken.
+SPEC_WINS = ("CustomFunctionName",)
+
+
+def probe_copy(n, name):
+    """The spec node as a probe pastes it: a custom event goes in under the probe node's own name, which nothing else
+    has, because its real name may already be a function of the probe's parent class. Its pins don't depend on its name."""
+    if n.get("type") == "custom_event":
+        return dict(n, name=name)
+    if n.get("type") == "raw" and "CustomEvent" in str(n.get("kind", "")):
+        props = n.get("props") or []
+        if isinstance(props, dict) and "CustomFunctionName" in props:
+            return dict(n, props=dict(props, CustomFunctionName=f'"{name}"'))
+        if isinstance(props, (list, tuple)):
+            return dict(n, props=[f'CustomFunctionName="{name}"' if EVENT_NAME.match(str(p).strip()) else p for p in props])
+    return n
+
+
 def bare_text(items):
     """Clipboard text with each (name, spec node) bare: what discovery pastes. The editor allocates the pins."""
     chunks = []
     for i, (name, n) in enumerate(items):
-        kind, props, pins = describe(n)
+        kind, props, pins = describe(probe_copy(n, name))
         chunks.append("\n".join([f'Begin Object Class={kind} Name="{name}"'] + props +
                                 [f"NodePosX={(i % 8) * 420}", f"NodePosY={(i // 8) * 360}", f"NodeGuid={new_id()}"] + pins + ["End Object"]))
     return "\n".join(chunks) + "\n"
@@ -309,8 +336,7 @@ def _retype(raw, element):
         else:
             raw = raw.replace(f'PinType.PinCategory="{cat}"', f'PinType.PinCategory="{cat}",PinType.PinSubCategory="{sub}"', 1)
     if element.get("obj"):
-        kind = "/Script/CoreUObject.Class" if cat in ("object", "class", "softobject", "softclass") else "/Script/CoreUObject.ScriptStruct"
-        raw = re.sub(r"PinType\.PinSubCategoryObject=[^,]*", f"PinType.PinSubCategoryObject=\"{kind}'{element['obj']}'\"", raw, count=1)
+        raw = re.sub(r"PinType\.PinSubCategoryObject=[^,]*", f"PinType.PinSubCategoryObject=\"{_object_kind(cat)}'{element['obj']}'\"", raw, count=1)
     return raw
 
 
@@ -514,10 +540,13 @@ def assemble(nodes, links, templates, prefix, existing=None):
     for n in nodes:
         b = built[n["id"]]
         x, y = n.get("x", auto[n["id"]][0] + ox), n.get("y", auto[n["id"]][1] + oy)
-        props = list(b["tpl"]["props"])
+        spec_props = [p for p in describe(n)[1] if not p.startswith("CustomProperties")]
+        own = {p.split("=", 1)[0]: p for p in spec_props if p.split("=", 1)[0] in SPEC_WINS}
+        # The template's properties, except the node's name: the probe pasted it under another one (see probe_copy).
+        props = [own.get(p.split("=", 1)[0], p) for p in b["tpl"]["props"]]
         have = {p.split("=", 1)[0] for p in props}
         # A bare node with nothing linked can forget what it was given (a macro's ResolvedWildcardType), so the spec's come back.
-        props += [p for p in describe(n)[1] if p.split("=", 1)[0] not in have and not p.startswith("CustomProperties")]
+        props += [p for p in spec_props if p.split("=", 1)[0] not in have]
         lines = [f'Begin Object Class={class_path(b["tpl"]["class"], n)} Name="{b["name"]}"'] + props
         lines += [f"NodePosX={int(x)}", f"NodePosY={int(y)}", f"NodeGuid={new_id()}"]
         for pin in b["pinlist"]:
@@ -629,6 +658,7 @@ def verify(sent_text, export_text):
     missing_nodes = [n for n in names if n not in found]
     landed = {}
     changed = []
+    renamed = []
     for n in sent:
         got = found.get(n["name"])
         if not got:
@@ -636,6 +666,10 @@ def verify(sent_text, export_text):
         landed[got["graph"]] = landed.get(got["graph"], 0) + 1
         if got["class"] != n["class"].split(".")[-1]:
             changed.append({"node": n["name"], "sent": n["class"].split(".")[-1], "now": got["class"]})
+        elif n.get("customFunctionName") and got.get("customFunctionName") != n["customFunctionName"]:
+            # The node is there under the name sent, but the event it defines is called something else now: every call
+            # to the event by the name asked for would find nothing.
+            renamed.append({"node": n["name"], "sent": n["customFunctionName"], "now": got.get("customFunctionName")})
     sent_links = bpscan.links_of(sent)
     kept = bpscan.links_of([found[n] for n in names if n in found])
     pure, replaced, joined = _join_around_pure(sent, found)
@@ -644,9 +678,21 @@ def verify(sent_text, export_text):
                 for n in names if n in found and (found[n].get("error") or found[n].get("orphaned_pins"))]
     return {"nodes_sent": len(names), "nodes_found": len(names) - len(missing_nodes), "missing_nodes": missing_nodes,
             "links_sent": len(sent_links), "missing_links": missing_links, "changed_class": changed,
+            "renamed_events": renamed,
             "pure_nodes": pure, "joined_links": _link_report(joined & kept, found),
             "problems": problems, "landed_in": landed,
-            "ok": not (missing_nodes or missing_links or changed)}
+            "ok": not (missing_nodes or missing_links or changed or renamed)}
+
+
+def renamed_event_hint(result):
+    """What to do about custom events that came back under another name, or None."""
+    renamed = result.get("renamed_events") or ()
+    if not renamed:
+        return None
+    names = ", ".join(f"{r['sent']} (now {r['now']})" for r in renamed)
+    return (f"The editor renamed {len(renamed)} custom event(s): {names}. A name is taken while a function of that name is still in the "
+            "Blueprint's compiled class (an event deleted but not yet compiled away) or on another node. Delete the renamed node, "
+            "compile, and paste again; with clear=true the graph is emptied and compiled before the paste.")
 
 
 EVENT_NODES = ("K2Node_Event", "K2Node_CustomEvent", "K2Node_Input", "K2Node_ComponentBoundEvent", "K2Node_ActorBoundEvent", "K2Node_Timeline")

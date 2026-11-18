@@ -77,6 +77,12 @@ def uninstall_hook():
     if bridge.is_dir():
         shutil.rmtree(bridge, ignore_errors=True)
         say(f"Removed {bridge}")
+    driver = paths.driver_file()
+    if driver.is_file():
+        driver.unlink()
+    worlds = paths.world_backup_dir()
+    if worlds.is_dir() and any(worlds.iterdir()):
+        say(f"Kept the copies of your test worlds in {worlds}: delete that folder yourself if you don't want them.")
 
 
 # ---- MCP client registration -------------------------------------------------

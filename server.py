@@ -16,9 +16,11 @@ No third-party packages. Run with any Python 3.9+:  python -I server.py
 import base64
 import calendar
 import gzip
+import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import sys
 import threading
@@ -35,7 +37,7 @@ import graphbuild  # noqa: E402
 import paths     # noqa: E402
 
 SERVER_NAME = "abiotic-mod-editor"
-SERVER_VERSION = "2.6.0"
+SERVER_VERSION = "2.7.0"
 
 EDITOR_ROOT = paths.find_editor_root()          # None when no Mod Editor install was found
 EDITOR_EXE = paths.editor_exe(EDITOR_ROOT)
@@ -44,6 +46,10 @@ EXPECTED_PROJECT = os.environ.get("ABF_EDITOR_PROJECT", "AbioticFactor")
 BRIDGE = paths.bridge_dir()
 DATA = HERE / "data"
 SHOTS = HERE / "screenshots"
+BACKUPS = HERE / "exports" / "backups"          # copies of asset files and graphs, made before a graph is cleared
+WORLDS = paths.worlds_dir()                     # the worlds Play In Editor loads and saves
+WORLD_BACKUPS = paths.world_backup_dir()
+DRIVER = paths.driver_file()
 NOT_FOUND = ("No Mod Editor install found. Install it from the Epic Games Launcher, or set ABF_EDITOR_ROOT "
              "(or editor_root in config.json next to server.py) to its folder.")
 
@@ -749,6 +755,37 @@ def _abf(args):
     return {"closed": asset.get_path_name()}
 '''
 
+# Where an asset's file is on disk, and whether the editor holds changes to it that the file doesn't have yet.
+PY_ASSET_FILE = PY_MOD_ROOTS + r'''
+def _abf(args):
+    path = args["asset_path"].split(".")[0]
+    asset = unreal.load_asset(path)
+    if asset is None:
+        return {"error": "asset not found: " + path}
+    package = asset.get_outermost().get_name()
+    parts = package.strip("/").split("/")
+    base = _plugin_dir("/" + parts[0])
+    dirty = [str(p.get_name()) for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()]
+    out = {"package": package, "class": asset.get_class().get_name(), "unsaved": package in dirty, "file": None}
+    if base and len(parts) > 1:
+        ext = ".umap" if isinstance(asset, unreal.World) else ".uasset"
+        out["file"] = base.replace("\\", "/").rstrip("/") + "/Content/" + "/".join(parts[1:]) + ext
+    return out
+'''
+
+PY_RELOAD_PACKAGE = r'''
+def _abf(args):
+    package = unreal.find_package(args["package"])
+    if package is None:
+        return {"reloaded": None, "reload_note": "the package wasn't loaded: the file on disk is what opens next"}
+    r = unreal.EditorLoadingAndSavingUtils.reload_packages([package], unreal.ReloadPackagesInteractionMode.ASSUME_POSITIVE)
+    parts = list(r) if isinstance(r, tuple) else [r]          # (reloaded?, the editor's message when it couldn't)
+    out = {"reloaded": bool(parts[0])}
+    if len(parts) > 1 and str(parts[-1]).strip():
+        out["reload_message"] = str(parts[-1])[:300]
+    return out
+'''
+
 PY_ASSET_BY_NAME = PY_MOD_ROOTS + r'''
 def _abf(args):
     reg = unreal.AssetRegistryHelpers.get_asset_registry()
@@ -867,6 +904,24 @@ def asset_list(name):
     return _LISTS[name]
 
 
+NUMBER_SUFFIX = re.compile(r"_(0|[1-9]\d{0,9})$")       # the part of a name Unreal keeps as a number, not as text
+_NUMBERED = {}
+
+
+def numbered_packages(name):
+    """{path without the number: [the list's files]} for the packages of a file list whose names end in _<number>.
+    A package file holds such a name (T_Noise_1) as the text T_Noise plus a number, so reading a file's bytes for
+    /Game references finds only the part before the number."""
+    if name not in _NUMBERED:
+        index = {}
+        for f in asset_list(name) or ():
+            stem, _, ext = f.rpartition(".")
+            if ext in ("uasset", "umap") and NUMBER_SUFFIX.search(stem):
+                index.setdefault(NUMBER_SUFFIX.sub("", stem), []).append(f)
+        _NUMBERED[name] = index
+    return _NUMBERED[name]
+
+
 # Files the official templates themselves contain; anything else in the folder ships too.
 SHIPPABLE = {".uasset", ".umap", ".uexp", ".ubulk", ".uplugin", ".abfmod", ".ini", ".png"}
 GAME_REF = re.compile(rb"/Game/[A-Za-z0-9_\-/]+(?:\.[A-Za-z0-9_\-]+)?")
@@ -889,7 +944,8 @@ def check_upload(mod_dir, ignore=()):
         except ValueError as e:
             report["errors"].append(f"{uplugins[0].name} is not valid JSON: {e}")
     retail, editor = asset_list("retail"), asset_list("editor")
-    missing, editor_only = {}, {}
+    retail_numbered, editor_numbered = numbered_packages("retail"), numbered_packages("editor")
+    missing, editor_only, numbered_only, either = {}, {}, {}, {}
     total = 0
     for f in root.rglob("*"):
         if not f.is_file():
@@ -913,14 +969,35 @@ def check_upload(mod_dir, ignore=()):
                 rel_game = "AbioticFactor/Content/" + pkg[len("/Game/"):]
                 if rel_game + ".uasset" in retail or rel_game + ".umap" in retail:
                     continue
-                if editor and (rel_game + ".uasset" in editor or rel_game + ".umap" in editor):
+                in_editor = bool(editor) and (rel_game + ".uasset" in editor or rel_game + ".umap" in editor)
+                if rel_game in retail_numbered:
+                    # T_Noise here is T_Noise_1 (or _2...) in the game: the file holds the number apart. Unless the
+                    # editor has a package of exactly this name, and then the bytes can't say which of the two is meant.
+                    if in_editor:
+                        either.setdefault(pkg, []).append(rel)
+                    continue
+                if in_editor:
                     editor_only.setdefault(pkg, []).append(rel)
+                elif rel_game in editor_numbered:
+                    numbered_only.setdefault(pkg, []).append(rel)
                 else:
                     missing.setdefault(pkg, []).append(rel)
     report["size_mb"] = round(total / 1048576, 2)
     for pkg, users in sorted(editor_only.items()):
         line = f"{pkg}: exists only in the editor, not the retail game (cloud cook / runtime will fail); used by {sorted(set(users))[:5]}"
         (report["ignored"] if any(i in pkg for i in ignore) else report["errors"]).append(line)
+    for pkg, users in sorted(numbered_only.items()):
+        names = sorted("/Game/" + f[len("AbioticFactor/Content/"):].rpartition(".")[0]
+                       for f in editor_numbered["AbioticFactor/Content/" + pkg[len("/Game/"):]])
+        line = (f"{pkg}: the packages with this name and a number ({', '.join(names[:4])}) exist only in the editor, not the retail game "
+                f"(cloud cook / runtime will fail); used by {sorted(set(users))[:5]}")
+        (report["ignored"] if any(i in pkg for i in ignore) else report["errors"]).append(line)
+    for pkg, users in sorted(either.items()):
+        names = sorted("/Game/" + f[len("AbioticFactor/Content/"):].rpartition(".")[0]
+                       for f in retail_numbered["AbioticFactor/Content/" + pkg[len("/Game/"):]])
+        line = (f"{pkg}: either the editor-only package of exactly that name (cloud cook would fail) or {', '.join(names[:4])}, which the "
+                f"game has; the file doesn't say which, so look at the asset; used by {sorted(set(users))[:5]}")
+        (report["ignored"] if any(i in pkg for i in ignore) else report["warnings"]).append(line)
     for pkg, users in sorted(missing.items()):
         line = f"{pkg}: not in the retail or editor asset list (may be a name, not a package); used by {sorted(set(users))[:5]}"
         (report["ignored"] if any(i in pkg for i in ignore) else report["warnings"]).append(line)
@@ -1004,6 +1081,382 @@ def tail_log(path, want, rx=None, since=None, max_bytes=64 << 20):
 
 
 # ---------------------------------------------------------------------------
+# Guards: things worth knowing before a tool does something that can't be taken back
+# ---------------------------------------------------------------------------
+
+# ---- an upload in progress ------------------------------------------------------
+# mod.io's log lines: "Beginning submission of mod source <id>" when the send starts, and
+# "ModManagementEvent Uploaded with status <n>" when it has ended, well or badly.
+
+UPLOAD_BEGIN = re.compile(r"Beginning submission of mod")
+UPLOAD_END = re.compile(r"Uploaded with status|Mod upload (?:has completed|canceled)")
+UPLOAD_EITHER = re.compile(UPLOAD_BEGIN.pattern + "|" + UPLOAD_END.pattern)
+UPLOAD_WINDOW = 30 * 60         # a submission that began longer ago than this with no end logged is taken as over
+
+
+def upload_in_progress(windows=None, now=None):
+    """Why the editor shouldn't be closed right now, or None: its Upload Mod window is open, or its log shows a mod.io
+    submission that began and has no end yet. Closing the editor then cuts the upload off."""
+    wins = wininput.editor_windows() if windows is None else windows
+    if any(w["title"].strip().lower().startswith("upload mod") for w in wins):
+        return "The editor's Upload Mod window is open: an upload is running, or about to start."
+    path = log_file()
+    if not path.is_file():
+        return None
+    now = time.time() if now is None else now
+    # Only the last half hour of the log is read: an older submission is taken as over, and the log can be very long.
+    lines, _ = tail_log(path, 1, UPLOAD_EITHER, since=now - UPLOAD_WINDOW, max_bytes=16 << 20)
+    if not lines or not UPLOAD_BEGIN.search(lines[-1]):
+        return None
+    m = LOG_STAMP.match(lines[-1])
+    age = now - calendar.timegm(tuple(int(v) for v in m.groups())) if m else 0
+    if age > UPLOAD_WINDOW:
+        return None
+    return f"The editor's log shows a mod.io upload that began {int(max(0, age))} s ago and has not finished."
+
+
+# ---- memory ------------------------------------------------------------------------
+# A Play In Editor session on a big map adds several GB that the editor never gives back. When the PC's commit limit
+# (RAM plus page file) is reached the editor dies where it stands, and that has been in the middle of clearing a graph.
+
+MEMORY_LOW_GB = 8.0             # warn when the PC has less than this left to commit...
+MEMORY_SHARE = 0.5              # ...or when one editor holds more than this share of the PC's commit limit
+
+
+def memory_note(committed_gb, free_gb, limit_gb):
+    """A warning to restart the editor before anything heavy, or None."""
+    if not committed_gb:
+        return None
+    if committed_gb > MEMORY_SHARE * limit_gb:
+        return (f"The editor holds {committed_gb:.1f} GB of the PC's {limit_gb:.1f} GB commit limit ({free_gb:.1f} GB left): restart it "
+                "(restart_editor) before another Play In Editor session or a big paste. It grows with every Play and crashes when the limit is reached.")
+    if free_gb < MEMORY_LOW_GB:
+        return (f"The PC has {free_gb:.1f} GB left to commit (the editor holds {committed_gb:.1f} GB): close other programs or restart the editor "
+                "before a Play In Editor session or a big paste, or the editor can run out of memory part-way.")
+    return None
+
+
+def editor_memory():
+    """{'editor': [{pid, in_ram_gb, committed_gb}], 'pc': {...}, 'note'?}: what each Mod Editor process holds and what
+    the PC has left."""
+    procs = []
+    for pid in wininput.editor_pids():
+        m = wininput.process_memory(pid)
+        if m:
+            procs.append({"pid": pid, "in_ram_gb": round(m[0] / 2 ** 30, 1), "committed_gb": round(m[1] / 2 ** 30, 1)})
+    out = {"editor": procs}
+    pc = wininput.system_memory()
+    if pc:
+        limit, free, ram = (v / 2 ** 30 for v in pc)
+        out["pc"] = {"ram_gb": round(ram, 1), "commit_limit_gb": round(limit, 1), "commit_free_gb": round(free, 1)}
+        note = memory_note(max((p["committed_gb"] for p in procs), default=0.0), free, limit)
+        if note:
+            out["note"] = note
+    return out
+
+
+# ---- which chat is driving ------------------------------------------------------------
+# Every chat has its own server process, and they can all reach the one editor. A lock lets one tool drive at a time, and a
+# small file says who drove last, so a chat can tell that another one is at work in the same editor.
+
+LOCK = wininput.InputLock()
+LOCK_WAIT = float(os.environ.get("ABF_MCP_LOCK_WAIT", "120"))
+OTHER_CHAT_WINDOW = 300         # seconds after another chat's tool for which this one is told about it
+
+
+def write_driver(tool, started, finished=None):
+    try:
+        DRIVER.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DRIVER.with_name(DRIVER.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"pid": os.getpid(), "tool": tool, "started": started, "finished": finished}), encoding="utf-8")
+        os.replace(tmp, DRIVER)
+    except OSError:
+        pass                    # the record is a courtesy; a tool never fails over it
+
+
+def read_driver(now=None):
+    """Who drove the editor last: {server_pid, tool, seconds_ago, this_chat, server_alive}, or None."""
+    try:
+        d = json.loads(DRIVER.read_text(encoding="utf-8"))
+        pid = int(d["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    when = d.get("finished") or d.get("started") or 0
+    mine = pid == os.getpid()
+    return {"server_pid": pid, "tool": d.get("tool"), "seconds_ago": int(max(0, (time.time() if now is None else now) - when)),
+            "this_chat": mine, "server_alive": mine or wininput.pid_alive(pid)}
+
+
+def other_chat_note(driver):
+    """A line for a tool's reply when another chat's server drove the editor a moment ago, else None."""
+    if not driver or driver["this_chat"] or not driver["server_alive"] or driver["seconds_ago"] > OTHER_CHAT_WINDOW:
+        return None
+    return (f"Note: another chat's server (process {driver['server_pid']}) drove the editor {driver['seconds_ago']} s ago with {driver['tool']}. "
+            "Two chats sharing one editor undo each other's work: check editor_status (the open mod, unsaved packages, Play In Editor) before going on.")
+
+
+# ---- copies of the test worlds ------------------------------------------------------
+# Play In Editor loads a saved world, saves it again as it starts and keeps saving while it runs, so every test changes
+# it. Whoever tested in it last may want that state back.
+
+WORLD_AUTO_KEEP = 20            # automatic copies kept per world; copies made on request are never removed
+WORLD_AUTO_MAX_MB = 500         # a bigger world isn't copied automatically
+
+
+def folder_hash(folder):
+    """One hash for everything in a folder, file names and contents: equal hashes mean equal folders."""
+    folder = Path(folder)
+    names = sorted(str(p.relative_to(folder)).replace("\\", "/") for p in folder.rglob("*") if p.is_file())
+    h = hashlib.sha256()
+    for name in names:
+        h.update(name.encode("utf-8") + b"\0")
+        h.update(hashlib.sha256((folder / name).read_bytes()).digest())
+    return h.hexdigest()
+
+
+def folder_size(folder):
+    files = [p for p in Path(folder).rglob("*") if p.is_file()]
+    return len(files), sum(p.stat().st_size for p in files)
+
+
+def world_names():
+    return sorted(d.name for d in WORLDS.iterdir() if d.is_dir()) if WORLDS.is_dir() else []
+
+
+def world_backups(world):
+    """This server's copies of one test world, newest first: [{name, folder, hash, made, made_text, label, auto, files, mb}]."""
+    root, out = WORLD_BACKUPS / world, []
+    for d in (root.iterdir() if root.is_dir() else ()):
+        try:
+            info = json.loads((d / "backup.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(info, dict) and (d / "world").is_dir():
+            out.append(dict(info, name=d.name, folder=str(d / "world")))
+    return sorted(out, key=lambda b: b.get("made") or 0, reverse=True)
+
+
+def backup_world(world, label=None, auto=False):
+    """Copy a test world aside. With no label, a copy that already has the same contents is returned instead (new=False)."""
+    src = WORLDS / world
+    if not src.is_dir():
+        raise RemoteError(f"No test world named {world!r} in {WORLDS}. Worlds: {world_names()}")
+    digest = folder_hash(src)
+    same = next((b for b in world_backups(world) if b.get("hash") == digest), None)
+    if same and not label:
+        return dict(same, new=False)
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-.")[:40] if label else ""
+    name = time.strftime("%Y%m%d-%H%M%S") + ("-" + safe if safe else "")
+    dest, n = WORLD_BACKUPS / world / name, 1
+    while dest.exists():
+        n += 1
+        dest = WORLD_BACKUPS / world / f"{name}-{n}"
+    shutil.copytree(src, dest / "world")
+    copied = folder_hash(dest / "world")
+    if copied != digest:                        # the world was saved while it was being copied: once more
+        shutil.rmtree(dest / "world")
+        shutil.copytree(src, dest / "world")
+        copied = folder_hash(dest / "world")
+    files, size = folder_size(dest / "world")
+    info = {"world": world, "hash": copied, "made": time.time(), "made_text": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "label": label or None, "auto": bool(auto), "files": files, "mb": round(size / 1048576, 1)}
+    (dest / "backup.json").write_text(json.dumps(info, indent=1), encoding="utf-8")
+    if auto:
+        for old in [b for b in world_backups(world) if b.get("auto")][WORLD_AUTO_KEEP:]:
+            shutil.rmtree(Path(old["folder"]).parent, ignore_errors=True)
+    return dict(info, name=dest.name, folder=str(dest / "world"), new=True)
+
+
+def auto_backup_worlds():
+    """Before a Play In Editor session: copy every test world that has no copy with its present contents."""
+    out = []
+    for world in world_names():
+        try:
+            _, size = folder_size(WORLDS / world)
+            if size > WORLD_AUTO_MAX_MB << 20:
+                out.append({"world": world, "skipped": f"{size >> 20} MB is too big to copy before every Play; use test_world(action='backup')"})
+                continue
+            earlier = bool(world_backups(world))
+            b = backup_world(world, auto=True)
+            entry = {"world": world, "backup": b["name"], "new": b["new"]}
+            if b["new"]:
+                entry["note"] = ("The world had changed since the last copy, so someone has played in it. This copy is the world as it was just now."
+                                 if earlier else "First copy of this world.")
+            out.append(entry)
+        except (OSError, RemoteError) as e:
+            out.append({"world": world, "error": f"not copied: {str(e)[:200]}"})
+    return out
+
+
+def restore_world(world, name):
+    """Put a test world back from one of this server's copies, after copying the present one aside, and check the result."""
+    backups = world_backups(world)
+    pick = next((b for b in backups if b["name"] == name), None)
+    if pick is None:
+        raise RemoteError(f"No backup named {name!r} of {world}. Backups, newest first: {[b['name'] for b in backups][:15]}")
+    if editor_process_running():
+        try:
+            playing = run_json(PY_PIE_RUNNING, timeout=30).get("playing")
+        except RemoteError:
+            raise RemoteError("The editor is running but not answering, so it can't be asked whether a Play is running: nothing was restored.")
+        if playing:
+            raise RemoteError("Play In Editor is running, and it saves the world while it runs and as it stops: stop it first "
+                              "(play_in_editor(action='stop')), then restore.")
+    src, live = Path(pick["folder"]), WORLDS / world
+    if folder_hash(src) != pick["hash"]:
+        raise RemoteError(f"The backup {name} no longer matches the hash recorded for it; not restoring from it.")
+    report = {"world": world, "restored": pick["name"]}
+    tmp, old = WORLDS.parent / f"{world}.mcp-restore", WORLDS.parent / f"{world}.mcp-old"
+    if old.is_dir() and not live.exists():      # an earlier restore stopped half-way: the world is the folder it set aside
+        os.replace(old, live)
+    if live.is_dir():
+        if folder_hash(live) == pick["hash"]:
+            return dict(report, note="The world already equals that backup; nothing was copied.", hash_checked=True)
+        report["replaced_state_kept_as"] = backup_world(world, auto=True)["name"]
+    for d in (tmp, old):
+        if d.exists():
+            shutil.rmtree(d)
+    shutil.copytree(src, tmp)
+    try:
+        if folder_hash(tmp) != pick["hash"]:
+            raise RemoteError("The copy of the backup didn't match it; the world was left as it was.")
+        if live.is_dir():
+            os.replace(live, old)
+        os.replace(tmp, live)
+    except OSError as e:
+        if old.is_dir() and not live.exists():
+            os.replace(old, live)
+        raise RemoteError(f"Couldn't swap the world's folder ({e}); is something using its files? The world was left as it was.")
+    finally:
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+    shutil.rmtree(old, ignore_errors=True)
+    report["hash_checked"] = folder_hash(live) == pick["hash"]
+    return report
+
+
+def world_status(world=None):
+    out = {"worlds_folder": str(WORLDS), "backup_folder": str(WORLD_BACKUPS), "worlds": []}
+    for name in ([world] if world else world_names()):
+        live = WORLDS / name
+        if not live.is_dir():
+            out["worlds"].append({"world": name, "error": "no such world"})
+            continue
+        files, size = folder_size(live)
+        newest = max((p.stat().st_mtime for p in live.rglob("*") if p.is_file()), default=0)
+        digest, backups = folder_hash(live), world_backups(name)
+        out["worlds"].append({
+            "world": name, "files": files, "mb": round(size / 1048576, 1),
+            "last_saved": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(newest)) if newest else None,
+            "same_as_backup": next((b["name"] for b in backups if b.get("hash") == digest), None),
+            "backups_total": len(backups),
+            "backups": [{k: b.get(k) for k in ("name", "made_text", "label", "auto", "mb")} for b in backups[:15]]})
+    return out
+
+
+# ---- copies of an asset before its graph is cleared -----------------------------------
+
+def asset_file_info(asset):
+    """{'file': where the asset is on disk, 'unsaved': whether the editor holds changes the file lacks}, or {'error'}."""
+    try:
+        return run_json(PY_ASSET_FILE, {"asset_path": asset}, timeout=60)
+    except RemoteError as e:
+        return {"error": str(e)[:160]}
+
+
+def backup_before_clear(asset, graph, export_text=None, text_copy=True, info=None):
+    """Before Ctrl+A and Delete in a graph: copy the asset's file aside, and write the graph's nodes as clipboard text.
+    The file is the last saved state; the text is the graph as it is now, saved or not, and paste_graph puts it back.
+    info: asset_file_info from before the marker paste, which itself counts as an unsaved change."""
+    out, stamp = {}, time.strftime("%Y%m%d-%H%M%S")
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    unsaved = False
+    try:
+        info = info or asset_file_info(asset)
+        if info.get("error"):
+            raise RemoteError(info["error"])
+        src = Path(info["file"]) if info.get("file") else None
+        if src and src.is_file():
+            dest = BACKUPS / f"{src.stem}-{stamp}{src.suffix}"
+            shutil.copy2(src, dest)
+            out["file"] = str(dest)
+            unsaved = bool(info.get("unsaved"))
+        else:
+            out["file_note"] = "the asset has no file on disk yet (never saved), so there was no file to copy"
+    except (RemoteError, OSError) as e:
+        out["file_note"] = f"file not copied: {str(e)[:160]}"
+    try:
+        parsed = bpscan.parse_t3d(export_text if export_text is not None else export_mod_t3d(asset), keep_body=True) if text_copy else None
+        existing = graphbuild.existing_nodes(parsed, graph) if parsed else {"paste": []}
+        if existing["paste"]:
+            text = graphbuild.assemble([], [], {}, "B" + format(int(time.time()) % 36 ** 6, "x").upper(), existing=existing)["text"]
+            dest = BACKUPS / f"{asset.rstrip('/').rsplit('/', 1)[-1]}-{graph}-{stamp}.t3d"
+            dest.write_text(text, encoding="utf-8")
+            out["graph_text"] = str(dest)
+            out["graph_nodes"] = len(existing["paste"])
+    except graphbuild.SpecError as e:
+        out["graph_text_note"] = f"no text copy of the graph: {e}"
+    except (RemoteError, OSError) as e:
+        out["graph_text_note"] = f"no text copy of the graph: {str(e)[:160]}"
+    if unsaved:
+        out["file_note"] = ("the asset had unsaved changes, which the file copy doesn't hold"
+                            + ("; graph_text holds this graph as it was" if out.get("graph_text") else ""))
+    how = []
+    if out.get("file"):
+        how.append("restore_asset(asset_path, backup_file=<file>) puts the saved file back")
+    if out.get("graph_text"):
+        how.append(f"paste_graph(file=<graph_text>, asset_path, clear=true, graph='{graph}') puts this graph's nodes back")
+    if how:
+        out["restore"] = "; ".join(how)
+    prune_backups()
+    return out
+
+
+BACKUPS_KEEP = 300              # copies kept in exports/backups; the oldest beyond that go when a new one is made
+
+
+def prune_backups(keep=None):
+    """Keep the newest copies in exports/backups and remove the rest, so the folder doesn't grow for ever."""
+    try:
+        files = sorted((p for p in BACKUPS.iterdir() if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in files[BACKUPS_KEEP if keep is None else keep:]:
+            old.unlink()
+    except OSError:
+        pass
+
+
+def restore_asset(asset, backup):
+    """Put an asset's file back from a copy of it and reload it in the editor. The file being replaced is kept."""
+    if asset.startswith("/Game/"):
+        raise RemoteError("Refusing: /Game is base-game content.")
+    src = Path(backup)
+    if not src.is_file():
+        raise RemoteError(f"No such backup file: {src}")
+    if run_json(PY_PIE_RUNNING, timeout=30).get("playing"):
+        raise RemoteError("Play In Editor is running: stop it first (play_in_editor(action='stop')), then restore.")
+    info = run_json(PY_ASSET_FILE, {"asset_path": asset}, timeout=60)
+    if info.get("error"):
+        raise RemoteError(info["error"])
+    if not info.get("file"):
+        raise RemoteError(f"Couldn't work out where {asset} is on disk.")
+    dest = Path(info["file"])
+    if dest.suffix.lower() != src.suffix.lower():
+        raise RemoteError(f"{src.name} is not a {dest.suffix} file, so it can't be a copy of {dest.name}.")
+    report = {"asset": info["package"], "file": str(dest), "restored_from": str(src)}
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    if dest.is_file():
+        kept = BACKUPS / f"{dest.stem}-replaced-{time.strftime('%Y%m%d-%H%M%S')}{dest.suffix}"
+        shutil.copy2(dest, kept)
+        report["replaced_file_kept_as"] = str(kept)
+    run_json(PY_CLOSE_ASSET, {"asset_path": asset}, timeout=60, remote_only=True)
+    shutil.copy2(src, dest)
+    report.update(run_json(PY_RELOAD_PACKAGE, {"package": info["package"]}, timeout=300, remote_only=True))
+    report["note"] = ("The file on disk is the copy now and the editor has reloaded it, so changes to this asset since that copy are gone. "
+                      "Compile the Blueprints that use it.")
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -1061,6 +1514,17 @@ def t_editor_status(args):
     note = version_mismatch(report["editor_version"], lists_version())
     if note:
         report["version_note"] = note
+    if report["windows"] or editor_process_running():
+        report["memory"] = editor_memory()
+        busy = upload_in_progress()
+        if busy:
+            report["upload"] = busy + " Don't close or restart the editor until it is done."
+    driver = read_driver()
+    if driver:
+        report["last_driver"] = driver
+        other = other_chat_note(driver)
+        if other:
+            report["last_driver"]["note"] = other[len("Note: "):]
     if node is not None or report["file_bridge"]:
         (HERE / "exports").mkdir(exist_ok=True)
         report.update(run_json(PY_STATUS, {"full": True, "settings_file": str(HERE / "exports" / "play_settings.t3d").replace("\\", "/")}, timeout=30))
@@ -1107,13 +1571,21 @@ def editor_process_running():
     return bool(wininput.editor_pids())
 
 
-def close_editor(wait=180.0):
-    """Close the editor as the title bar's X would, after checking nothing is unsaved, and wait until its process is gone.
-    The crash box the editor often shows at the very end of exit is dismissed. Returns the report dict."""
+def close_editor(wait=180.0, force=False):
+    """Close the editor as the title bar's X would, and wait until its process is gone. Refuses while an upload is
+    running, while packages are unsaved, and while the editor doesn't answer (its unsaved state can't be checked then);
+    force skips the first and the last of those. The crash box the editor often shows at the very end of exit is
+    dismissed. Returns the report dict."""
     wins = wininput.editor_windows()
     if not wins and not editor_process_running():
         return {"closed": False, "note": "The Mod Editor is not running."}
     report = {"windows_before": [w["title"] for w in wins]}
+    if wins and not force:
+        busy = upload_in_progress(wins)
+        if busy:
+            report.update(closed=False, error=busy + " Closing the editor now would cut it off, so it was left open. Wait until it is done "
+                                                     "(read_editor_log(contains='LogModio')); force=true closes it anyway.")
+            return report
     try:
         status = run_json(PY_STATUS, {"full": True, "settings_file": str(HERE / "exports" / "play_settings.t3d").replace("\\", "/")}, timeout=30)
         dirty = status.get("dirty_packages") or {}
@@ -1123,8 +1595,14 @@ def close_editor(wait=180.0):
             return report
         report["open_mods"] = [m["root"] for m in status.get("open_mods") or []]
     except RemoteError as e:
+        if wins and not force:              # with no window left it is already on its way out, and there is nothing to ask
+            report.update(closed=False, error=f"The editor isn't answering ({str(e)[:160]}), so its unsaved packages can't be checked and it was "
+                                              "left open. A dialog may be open, or it is busy: look with editor_windows and editor_screenshot. "
+                                              "force=true closes it anyway.")
+            return report
         report["note"] = f"couldn't ask the editor about unsaved packages ({str(e)[:120]}); closing anyway"
     main = next((w for w in wins if "Unreal Editor" in w["title"] or "Mod Browser" in w["title"]), wins[0] if wins else None)
+    before = {w["hwnd"] for w in wins}
     if main is not None:
         wininput.close_main_window(main)
     t0, deadline, dismissed = time.time(), time.time() + wait, []
@@ -1135,7 +1613,9 @@ def close_editor(wait=180.0):
             if "crash" in w["title"].lower():                     # the exit-time crash box: no data is lost, it just needs closing
                 wininput.close_window(w)
                 dismissed.append(w["title"])
-            elif "save content" in w["title"].lower() or "save" in w["title"].lower() and w is not main:
+            elif w["hwnd"] not in before and w["title"].strip().lower().startswith("save"):
+                # A window that opened because of the close and asks about saving. One that was already there and merely
+                # has "save" in its name (an asset editor on BP_SaveStation) is not a dialog.
                 report.update(closed=False, dialog=w["title"], error="A save dialog is open: answer it in the editor, then call close_editor again.")
                 return report
         if not now and not editor_process_running():
@@ -1146,12 +1626,12 @@ def close_editor(wait=180.0):
 
 
 def t_close_editor(args):
-    r = close_editor(float(args.get("wait_seconds", 180)))
+    r = close_editor(float(args.get("wait_seconds", 180)), bool(args.get("force")))
     return json.dumps(r, indent=2), bool(r.get("error"))
 
 
 def t_restart_editor(args):
-    report = {"close": close_editor(float(args.get("wait_seconds", 180)))}
+    report = {"close": close_editor(float(args.get("wait_seconds", 180)), bool(args.get("force")))}
     if report["close"].get("error"):
         return json.dumps(report, indent=2), True
     launched = t_launch_editor({"wait_seconds": args.get("launch_seconds", 300)})
@@ -1457,16 +1937,21 @@ def t_keys(args):
             return "The Mod Editor is not in front, and focusing it would close the menu; not sending keys.", True
     else:
         wininput.focus(win)
+    # The first thing sent has to find this very window in front: if a dialog opened over it, or the focus didn't take,
+    # the keys would act on another editor window. What follows may be meant for a window the first key opened.
+    first = None if keep else win
     done = []
     for combo in args.get("keys") or []:
-        wininput.keys(combo, int(args.get("hold_ms", 50)))
+        wininput.keys(combo, int(args.get("hold_ms", 50)), expect=first)
+        first = None
         done.append(combo)
         time.sleep(0.15)
     if args.get("text"):
-        wininput.type_text(args["text"])
+        wininput.type_text(args["text"], expect=first)
+        first = None
         done.append(f"typed {len(args['text'])} chars")
     if args.get("press_enter"):
-        wininput.keys("enter")
+        wininput.keys("enter", expect=first)
         done.append("enter")
     return f"Sent to '{win['title']}': {done}"
 
@@ -1546,19 +2031,30 @@ def show_event_graph(win, widget=False):
     time.sleep(0.8)
 
 
+def keys_in(win, combo):
+    """Press a combo only while this exact window is in front. Select-all, Delete and Paste go through here: the same
+    keys in another editor window would act on what is there, and in the level editor that is the map's actors."""
+    wininput.keys(combo, expect=win)
+
+
+def clear_showing_graph(win):
+    """Ctrl+A and Delete in the graph that has focus in this window."""
+    keys_in(win, "ctrl+a")
+    time.sleep(0.6)
+    keys_in(win, "delete")
+    time.sleep(0.8)
+
+
 def paste_into(win, text, x, y, clear=False, settle=3.0):
     # One process for click, select-all, delete and paste, so the graph keeps keyboard focus.
     wininput.set_clipboard(text)
     wininput.click(win, x, y)
     time.sleep(0.5)
     if clear:
-        wininput.keys("ctrl+a")
-        time.sleep(0.6)
-        wininput.keys("delete")
-        time.sleep(0.8)
+        clear_showing_graph(win)
         wininput.click(win, x, y)
         time.sleep(0.4)
-    wininput.keys("ctrl+v")
+    keys_in(win, "ctrl+v")
     time.sleep(settle)
 
 
@@ -1580,8 +2076,10 @@ NOTHING_ARRIVED = ("None of the nodes arrived, even with the Event Graph brought
                    "showing (a data-only Blueprint needs 'Open Full Blueprint Editor' first), then pass x/y on empty graph.")
 
 
-def paste_checked(text, asset=None, win=None, xy=None, clear=False, settle=3.0, end_comment=True, compile_it=False, save=True):
-    """Paste clipboard text, then read the Blueprint back and report what actually arrived. (report, is_error)"""
+def paste_checked(text, asset=None, win=None, xy=None, clear=False, settle=3.0, end_comment=True, compile_it=False, save=True, graph=None):
+    """Paste clipboard text, then read the Blueprint back and report what actually arrived. (report, is_error)
+    graph: the graph the paste is meant for. clear only empties that graph (the Event Graph when none is named), and
+    refuses when another one is showing; a paste with a graph named is an error when it lands elsewhere."""
     if end_comment:
         text, _ = graphbuild.ensure_end_comment(text)
     check = graphbuild.lint(text)
@@ -1631,17 +2129,39 @@ def paste_checked(text, asset=None, win=None, xy=None, clear=False, settle=3.0, 
             result["brought_graph_forward"] = True
         return result
 
-    before = bpscan.parse_t3d(export_mod_t3d(asset))
+    before_text = export_mod_t3d(asset)
+    before = bpscan.parse_t3d(before_text)
     if clear:
+        want = graph or "EventGraph"
+        on_disk = asset_file_info(asset)            # before the marker, which is itself an unsaved change
         marker = attempt(graphbuild.comment_block(), 1.0)
         if not marker["nodes_found"]:
             report.update(ok=False, pasted=False, hint=DIALOG_OPEN if marker.get("dialogs") else NOTHING_ARRIVED, dialogs=marker.get("dialogs", []))
             return report, True
-        # The marker landed, so a graph has focus: Ctrl+A and Delete can't reach components on the Viewport tab.
-        wininput.keys("ctrl+a")
-        time.sleep(0.6)
-        wininput.keys("delete")
-        time.sleep(0.8)
+        showing = next(iter(marker["landed_in"]), None)
+        if showing != want:
+            report.update(ok=False, pasted=False, showing=showing,
+                          note=f"{showing} is showing, not {want}, so nothing was deleted or pasted. clear empties one whole graph: bring the "
+                               f"{want} tab forward (open_asset with show_graph=true shows the Event Graph; for a function, open its tab), or "
+                               f"pass graph='{showing}' if that is the graph to empty. The marker comment that landed in {showing} can be deleted.")
+            return report, True
+        # The marker landed in the graph asked for, so that graph has the focus: Ctrl+A and Delete act on it, not on
+        # another graph's tab and not on the components of the Viewport tab.
+        low = editor_memory().get("note")
+        if low:
+            report["memory_note"] = low
+        report["backup"] = backup_before_clear(asset, want, before_text, info=on_disk)
+        there = {n["name"] for n in before["nodes"] if n.get("graph") == want and n["class"] not in graphbuild.KEPT_NODES}
+        clear_showing_graph(win)
+        left = sorted(there & {n["name"] for n in bpscan.parse_t3d(export_mod_t3d(asset))["nodes"] if n.get("graph") == want})
+        if left and len(left) == len(there):
+            report.update(ok=False, pasted=False, not_cleared=left[:20],
+                          note=f"Ctrl+A and Delete removed nothing from {want} (the graph may have lost the keyboard focus), so nothing was "
+                               "pasted over it. Look at the window with editor_screenshot and try again.")
+            return report, True
+        if left:
+            report["left_after_clear"] = left[:20]
+        report["cleared"] = want
         if HAS_CUSTOM_EVENT.search(text):
             # The deleted custom events' functions stay in the compiled class until a compile, and a pasted custom event
             # whose name is taken gets renamed. Compile the emptied graph first; errors are expected and nothing is saved.
@@ -1661,13 +2181,21 @@ def paste_checked(text, asset=None, win=None, xy=None, clear=False, settle=3.0, 
     if reused and not clear:
         report["note"] = (f"{len(reused)} node names were already in the Blueprint, so the editor renamed the new copies and they read as "
                           "missing. Use a new node-name prefix for each paste (build_graph does).")
-    hint = graphbuild.dropped_event_hint(text, result)
-    if hint:
-        report["hint"] = hint
+    is_error = not result["ok"]
+    elsewhere = sorted(str(g) for g in result["landed_in"] if g != graph) if graph and not clear else []
+    dropped, renamed = graphbuild.dropped_event_hint(text, result), graphbuild.renamed_event_hint(result)
     if not result["nodes_found"]:
         report["hint"] = NOTHING_ARRIVED
-    is_error = not result["ok"]
-    if compile_it and result["ok"]:
+    elif dropped:
+        report["hint"] = dropped
+    elif elsewhere:
+        report["hint"] = (f"The nodes landed in {', '.join(elsewhere)}, not {graph}: that was the graph tab showing. Ctrl+Z in that window "
+                          f"takes the paste back (editor_keys); then bring the {graph} tab forward and paste again.")
+        report["ok"] = False
+        is_error = True
+    elif renamed:
+        report["hint"] = renamed
+    if compile_it and result["ok"] and not elsewhere:
         c = compile_blueprint(asset, save)
         report["compile"] = c
         is_error = not c.get("ok")
@@ -1699,6 +2227,7 @@ def merge_checked(text, asset, graph, settle=3.0, compile_it=False, save=True):
             return {"nodes_found": 0, "landed_in": {}, "dialogs": dialogs, "ok": False}
         return graphbuild.verify(body, export_mod_t3d(asset))
 
+    on_disk = asset_file_info(asset)                # before the marker, which is itself an unsaved change
     marker = land(graphbuild.comment_block(), 1.0)
     if not marker["nodes_found"] and not marker.get("dialogs") and graph == "EventGraph":
         show_event_graph(win, widget)
@@ -1717,10 +2246,11 @@ def merge_checked(text, asset, graph, settle=3.0, compile_it=False, save=True):
                            f"(the marker comment that landed in {showing} can be deleted).")
         return report, True
     # The marker landed in the graph asked for, so Ctrl+A and Delete act on it, not on components.
-    wininput.keys("ctrl+a")
-    time.sleep(0.6)
-    wininput.keys("delete")
-    time.sleep(0.8)
+    low = editor_memory().get("note")
+    if low:
+        report["memory_note"] = low
+    report["backup"] = backup_before_clear(asset, graph, text_copy=False, info=on_disk)     # build_graph wrote the graph's text already
+    clear_showing_graph(win)
     report["cleared"] = graph
     if HAS_CUSTOM_EVENT.search(text):
         # The functions of the custom events just deleted stay in the compiled class until a compile, and a pasted custom
@@ -1739,7 +2269,9 @@ def merge_checked(text, asset, graph, settle=3.0, compile_it=False, save=True):
             "around it (joined_links). That graph is right. Leave those pins out next time."]
     is_error = not result["ok"]
     if not result["ok"]:
-        report["hint"] = ("Part of the graph didn't come back. The backup named in the build_graph report holds the old nodes as clipboard "
+        renamed = graphbuild.renamed_event_hint(result)
+        report["hint"] = ((renamed + " " if renamed else "Part of the graph didn't come back. ")
+                          + "The backup named in the build_graph report holds the old nodes as clipboard "
                           "text: paste_graph with that file, asset_path and clear=true restores them.")
     if compile_it and result["ok"]:
         c = compile_blueprint(asset, save)
@@ -1758,7 +2290,7 @@ def t_paste_graph(args):
         win = win or (open_asset_window(args["asset_path"])[0] if args.get("asset_path") else wininput.find_window())
         xy = _scaled(win, args)
     report, is_error = paste_checked(text, args.get("asset_path"), win, xy, bool(args.get("clear")), float(args.get("settle_seconds", 3)),
-                                     args.get("end_comment", True), bool(args.get("compile")), args.get("save", True))
+                                     args.get("end_comment", True), bool(args.get("compile")), args.get("save", True), args.get("graph"))
     return json.dumps(report, indent=2), is_error
 
 
@@ -1952,7 +2484,8 @@ def t_build_graph(args):
     links = args.get("links") or spec.get("links") or []
     spec_nodes = args.get("nodes") or spec.get("nodes") or []
     merge = bool(args.get("merge", spec.get("merge")))
-    graph = args.get("graph") or spec.get("graph") or "EventGraph"
+    graph_named = args.get("graph") or spec.get("graph")
+    graph = graph_named or "EventGraph"
     asset = args.get("asset_path") or spec.get("asset_path")
     if not spec_nodes and not merge:
         return "Pass nodes (and links), or spec_file: a JSON file holding both.", True
@@ -2002,7 +2535,7 @@ def t_build_graph(args):
         pasted, is_error = merge_checked(built["text"], asset, graph, settle, bool(args.get("compile")), args.get("save", True))
     else:
         pasted, is_error = paste_checked(built["text"], asset, clear=bool(args.get("clear")), settle=settle,
-                                         compile_it=bool(args.get("compile")), save=args.get("save", True))
+                                         compile_it=bool(args.get("compile")), save=args.get("save", True), graph=graph_named)
     report["paste"] = pasted
     report["ok"] = not is_error
     return json.dumps(report, indent=2), is_error
@@ -2096,7 +2629,7 @@ def t_add_variable(args):
     if not args.get("keep_node"):
         wininput.click(win, *title)
         time.sleep(0.3)
-        wininput.keys("delete")
+        keys_in(win, "delete")
         time.sleep(0.8)
         still = [n["name"] for n in bpscan.parse_t3d(export_mod_t3d(asset))["nodes"] if n["name"] == node_name]
         report["node_removed"] = not still
@@ -2315,9 +2848,15 @@ def t_play_in_editor(args):
         if not report:
             report["settings"] = set_play_settings()
         return json.dumps(report, indent=2)
+    if args.get("backup_world", True):
+        # Play saves the test world as it starts, so this is the last moment the world is still as someone left it.
+        report["world_backup"] = auto_backup_worlds()
+    low = editor_memory().get("note")
+    if low:
+        report["memory_note"] = low
     win = wininput.find_window()
     wininput.focus(win)
-    wininput.keys("alt+p", 80)
+    wininput.keys("alt+p", 80, expect=win)
     deadline = time.time() + float(args.get("wait_seconds", 60))
     while time.time() < deadline:
         time.sleep(1.5)
@@ -2464,6 +3003,32 @@ def t_read_editor_log(args):
     return f"{path}: last {len(lines)} matching lines{note}\n" + "\n".join(lines)
 
 
+def t_test_world(args):
+    action = args.get("action", "status")
+    if action == "status":
+        return json.dumps(world_status(args.get("world")), indent=2)
+    worlds = world_names()
+    world = args.get("world") or (worlds[0] if len(worlds) == 1 else None)
+    if not world:
+        return f"Pass world: {WORLDS} holds {len(worlds)} test worlds: {worlds}", True
+    if action == "backup":
+        b = backup_world(world, args.get("label"))
+        out = {k: b.get(k) for k in ("world", "name", "new", "label", "files", "mb", "folder")}
+        if not b["new"]:
+            out["note"] = "A copy with these exact contents was already there, so no new one was made."
+        return json.dumps(out, indent=2)
+    if action == "restore":
+        if not args.get("backup"):
+            return (f"Pass backup: the name of the copy to put back. Copies of {world}, newest first: "
+                    f"{[b['name'] for b in world_backups(world)][:15]}"), True
+        return json.dumps(restore_world(world, args["backup"]), indent=2)
+    return "action must be status, backup or restore.", True
+
+
+def t_restore_asset(args):
+    return json.dumps(restore_asset(args["asset_path"], args["backup_file"]), indent=2)
+
+
 S = lambda **p: p  # noqa: E731
 STR, NUM, INT, BOOL, OBJ = ({"type": "string"}, {"type": "number"}, {"type": "integer"}, {"type": "boolean"}, {"type": "object"})
 WIN = {"type": "string", "description": "Part of the editor window title (default: the main editor window). See editor_windows."}
@@ -2473,18 +3038,23 @@ TOOLS = [
     ("editor_status", t_editor_status,
      "Call first. Whether the Mod Editor is running and reachable (remote execution / file bridge), which mod is open, the map, whether Play In Editor "
      "is running, the unsaved (dirty) packages, the Play In Editor settings the next session will use (net mode, client count: they persist across "
-     "restarts), the editor's version and whether the file lists in data/ match it.",
+     "restarts), the editor's version and whether the file lists in data/ match it. Also: memory (what the editor holds and the PC has left, with "
+     "a note when it is time to restart the editor), upload (a mod.io upload is running: don't close the editor), and last_driver (which chat's "
+     "server drove the editor last and how long ago: another chat may be at work in it).",
      S(wait_seconds=NUM), []),
     ("launch_editor", t_launch_editor,
      "Start the Mod Editor and wait until it is reachable. It opens on the Mod Browser picker; then use open_mod.",
      S(wait_seconds=NUM), []),
     ("close_editor", t_close_editor,
      "Close the Mod Editor the way its title bar's X does, after checking nothing is unsaved (unsaved packages are an error: save or discard first), "
-     "and wait until its process is gone; the crash box it often shows at the very end of exit is dismissed. Switching mods needs this: the picker only shows at start.",
-     S(wait_seconds=NUM), []),
+     "and wait until its process is gone; the crash box it often shows at the very end of exit is dismissed. Switching mods needs this: the picker only shows at start. "
+     "It also refuses while a mod.io upload is running (the Upload Mod window is open, or the log shows a submission with no end yet) and while the "
+     "editor doesn't answer, since its unsaved state can't be checked then; force=true skips those two checks, never the unsaved-packages one.",
+     S(wait_seconds=NUM, force=BOOL), []),
     ("restart_editor", t_restart_editor,
      "close_editor, then launch_editor, then open_mod(mod_file) when given: the way to switch to another mod, or to test that rows and Blueprints really "
-     "saved to disk (a fresh editor reads only what's on disk).", S(mod_file=STR, wait_seconds=NUM, launch_seconds=NUM, open_seconds=NUM), []),
+     "saved to disk (a fresh editor reads only what's on disk). Refuses what close_editor refuses; force as there.",
+     S(mod_file=STR, wait_seconds=NUM, launch_seconds=NUM, open_seconds=NUM, force=BOOL), []),
     ("open_mod", t_open_mod,
      "Open a mod project (.abfmod file or its folder) from the Mod Browser picker via Browse... "
      "(the command line can't open one). Works only while the picker is showing.",
@@ -2560,18 +3130,23 @@ TOOLS = [
      dict(XY, window=WIN, button={"type": "string", "enum": ["left", "right"]}, double=BOOL, keep_menu=BOOL), ["x", "y"]),
     ("editor_keys", t_keys,
      "Focus a Mod Editor window (optionally click x/y first), then press key combos (e.g. ['ctrl+s'], ['alt+p'], ['delete']), "
-     "type text, and/or press Enter. Keys only go to the editor when it is in front. In PIE hold keys 300 ms+ (hold_ms). "
+     "type text, and/or press Enter. A key is a letter, a digit, a punctuation character (; = , - . / ` [ \\ ] ') or a name (enter, esc, tab, space, "
+     "delete, home, f1-f12, plus, numpad0-9, ...). Keys only go to the editor when it is in front, and the first one only when the window named "
+     "is the one in front (a dialog over it is an error that names the dialog). In PIE hold keys 300 ms+ (hold_ms). "
      "keep_menu=true (or window='popup') sends them without focusing first, so an open menu stays open: arrows, Enter, Escape, or text for a menu that searches.",
      dict(XY, window=WIN, keys={"type": "array", "items": STR}, text=STR, press_enter=BOOL, hold_ms=INT, keep_menu=BOOL), []),
     ("paste_graph", t_paste_graph,
      "Paste Blueprint clipboard text (T3D nodes) into the graph showing in a Blueprint's window, then read the Blueprint back and "
      "report any nodes or links that didn't arrive, and which graph they landed in. Give asset_path: it opens the Blueprint and enables the "
      "check, and brings the Event Graph forward if nothing arrives (for another graph, open its tab first). Lints first (duplicate pins, broken links) "
-     "and adds a comment node at the end, because the editor drops the links of the last pasted node. clear = delete what's in the showing graph first "
-     "(needs asset_path). compile = compile if the paste is clean. Paste in passes so custom events exist and are compiled before callers; calls to "
-     "missing functions are dropped. A pure node given exec pins isn't a failure: the editor joins the chain around it (pure_nodes, joined_links). "
+     "and adds a comment node at the end, because the editor drops the links of the last pasted node. clear = empty a graph first (needs asset_path): "
+     "the graph named by graph, the Event Graph when none is named, and only when that graph is the tab showing: with another one showing nothing "
+     "is deleted. Before it deletes, the asset's file and the graph's nodes are copied aside (backup; restore_asset or paste_graph put them back). "
+     "graph without clear makes a paste that lands in another graph an error. compile = compile if the paste is clean. Paste in passes so custom "
+     "events exist and are compiled before callers; calls to missing functions are dropped. A custom event that comes back under another name is "
+     "an error (renamed_events). A pure node given exec pins isn't a failure: the editor joins the chain around it (pure_nodes, joined_links). "
      "Prefer build_graph for new logic.",
-     dict(XY, window=WIN, asset_path=STR, text=STR, file=STR, clear=BOOL, settle_seconds=NUM, end_comment=BOOL, compile=BOOL, save=BOOL), []),
+     dict(XY, window=WIN, asset_path=STR, text=STR, file=STR, clear=BOOL, graph=STR, settle_seconds=NUM, end_comment=BOOL, compile=BOOL, save=BOOL), []),
     ("open_asset", t_open_asset,
      "Open an asset's editor window (Blueprint, widget, material...) and return its window title for the other window tools. "
      "show_graph brings a Blueprint's Event Graph or a widget's Graph view forward; new ones open on the Viewport or Designer.",
@@ -2590,7 +3165,7 @@ TOOLS = [
      "it also pastes and verifies; compile=true compiles a clean paste. Paste custom events and compile before pasting callers.\n"
      "nodes: [{id, type, x?, y?, args?: {pin: literal default}, element?: {cat, obj?} for wildcard pins}]. Types and their fields: "
      "call {owner?, function} (no owner = this Blueprint's own); array_call {function}; call_parent {owner, function}; event {owner, function}; "
-     "custom_event {name, params?: [{name, cat (a float is cat real), obj?, array?}], rpc?: server|client|multicast, reliable?}; var_get / var_set {name, owner?}; cast {target}; branch; "
+     "custom_event {name, params?: [{name, cat (a float is cat real; an enum is cat byte with obj = the enum's path), obj?, array?}], rpc?: server|client|multicast, reliable?}; var_get / var_set {name, owner?}; cast {target}; branch; "
      "sequence {outputs?}; self; make_array {count, element}; make_struct / break_struct {struct}; foreach {element}; input_action {name, consume?}; "
      "spawn_actor / add_component {class}; create_delegate {function}; comment {text, width?, height?}; raw {kind, props? (['Key=Value'] lines or {Key: Value}, values written as given), pins?}.\n"
      "links: [['a.then', 'b.execute'], ['c.ReturnValue', 'd.InString']]. Exec pins are usually execute/then; see discover_pins. "
@@ -2599,6 +3174,8 @@ TOOLS = [
      "e.g. ['K2Node_CustomEvent_3.then', 'say.execute']. Existing nodes come back under new names (merge.renamed) with their links and positions; "
      "a backup of them as clipboard text is written first. A function's entry/result nodes can't be re-pasted: links to them are listed under "
      "merge.links_to_rewire. graph (default EventGraph) must be the tab showing; nothing is deleted until a marker paste proves it is. "
+     "clear=true (without merge) empties that same graph before the paste, under the same rule, after copying the asset's file and the graph's "
+     "nodes aside (paste.backup). A custom event that comes back under another name fails the paste (paste.renamed_events). "
      "spec_file: JSON file with nodes and links (and merge/graph/asset_path), for big graphs.",
      S(nodes={"type": "array", "items": OBJ}, links={"type": "array", "items": {"type": "array", "items": STR}}, spec_file=STR, asset_path=STR,
        parent_class=STR, prefix=STR, out_file=STR, paste=BOOL, clear=BOOL, compile=BOOL, save=BOOL, merge=BOOL, graph=STR, settle_seconds=NUM), []),
@@ -2622,9 +3199,23 @@ TOOLS = [
     ("play_in_editor", t_play_in_editor,
      "Start (Alt+P in the main window) or stop Play In Editor. Load a real map first (e.g. /Game/Maps/Facility); close the Message Log first. "
      "net_mode (standalone, listen_server, client = a dedicated server plus the clients) and clients set the editor's Play settings before starting; "
-     "they persist across restarts, so editor_status shows them. action='settings' only sets or reads them.",
+     "they persist across restarts, so editor_status shows them. action='settings' only sets or reads them. Before it starts, every test world "
+     "that has changed since its last copy is copied aside (world_backup; Play saves the world as it starts): test_world restores one. "
+     "backup_world=false skips that. memory_note says when the editor should be restarted first.",
      S(action={"type": "string", "enum": ["start", "stop", "settings"]}, net_mode={"type": "string", "enum": ["standalone", "listen_server", "client"]},
-       clients=INT, wait_seconds=NUM), []),
+       clients=INT, wait_seconds=NUM, backup_world=BOOL), []),
+    ("test_world", t_test_world,
+     "The saved worlds Play In Editor loads (Saved/SaveGames/Editor/Worlds), which every Play session changes. action='status' (default): each "
+     "world's size, when it was last saved, whether it equals one of this server's copies, and the copies, newest first. action='backup': copy a "
+     "world aside now (label names the copy, e.g. 'before-tests'). action='restore': put a copy back (backup = its name), after copying the present "
+     "world aside, with a whole-folder hash check; not while Play In Editor runs. world may be left out when there is only one. Copies live outside "
+     "the editor's folders; play_in_editor makes one before each Play when the world has changed, and keeps the newest 20 of those.",
+     S(action={"type": "string", "enum": ["status", "backup", "restore"]}, world=STR, label=STR, backup=STR), []),
+    ("restore_asset", t_restore_asset,
+     "Put a mod asset's file back from a copy of it (backup_file: the 'file' a clear reported under backup, or any earlier copy of the same "
+     ".uasset) and reload it in the editor: for a graph cleared or pasted over by mistake. Closes the asset's editor window, keeps the file "
+     "it replaces, and drops unsaved changes to that asset. Not while Play In Editor runs.",
+     S(asset_path=STR, backup_file=STR), ["asset_path", "backup_file"]),
     ("get_game_row", t_get_game_row,
      "Read a base-game row as export text by kind + name (kind = snake_case of the game's <Kind>HandleFunctionLibrary: "
      "global_item, gear_item, weapon_item, craftable_item, deployable_item, pickup_item, food_and_gibs_item, pet_item, plant_item, "
@@ -2669,6 +3260,11 @@ TOOL_MAP = {t[0]: t for t in TOOLS}
 READ_ONLY_TOOLS = {"editor_status", "list_mods", "list_mod_templates", "find_assets", "get_row", "get_game_row", "editor_windows",
                    "editor_screenshot", "inspect_blueprint", "export_t3d", "t3d_errors", "blueprint_filter_check", "check_upload",
                    "read_editor_log", "pie_info"}
+# Tools that take the mouse or keyboard, or change what the editor is doing as a whole. One of them runs at a time
+# across every server process on the PC (LOCK), and each leaves a note of who drove last (DRIVER).
+DRIVING_TOOLS = {"launch_editor", "close_editor", "restart_editor", "open_mod", "load_map", "editor_menu", "editor_drag", "editor_click",
+                 "editor_keys", "paste_graph", "open_asset", "close_asset", "discover_pins", "build_graph", "add_variable",
+                 "override_function", "run_asset_audit", "play_in_editor", "close_editor_window", "delete_asset", "restore_asset"}
 
 INSTRUCTIONS = (
     "Tools for the official Abiotic Factor Mod Editor (custom Unreal 5.4.4 cooked editor, Python 3.11). Start with editor_status. "
@@ -2678,7 +3274,10 @@ INSTRUCTIONS = (
     "paste_graph takes T3D you already have. compile_blueprint reports compiler errors. "
     "Copied game Blueprints must pass the upload Asset Audit (Blueprint filter) and the cloud cook; run check_upload before an upload. "
     "Screenshots are per editor window only. Menus are popup windows: editor_menu opens one and shows it, editor_click(window='popup') picks. "
-    "add_variable, override_function and run_asset_audit drive the editor's menus for what Python can't do. The user does mod.io uploads."
+    "add_variable, override_function and run_asset_audit drive the editor's menus for what Python can't do. The user does mod.io uploads. "
+    "The editor may be shared: editor_status says whether an upload is running (never close the editor then), how much memory it holds, and "
+    "whether another chat drove it last. clear empties one named graph and copies it aside first; play_in_editor copies the test world first "
+    "(test_world restores it)."
 )
 
 
@@ -2706,19 +3305,38 @@ def handle(req):
                                **({"annotations": {"readOnlyHint": True}} if n in READ_ONLY_TOOLS else {}))
                           for n, _, d, p, r in TOOLS]}
     if method == "tools/call":
-        tool = TOOL_MAP.get(params.get("name"))
+        name = params.get("name")
+        tool = TOOL_MAP.get(name)
         if not tool:
-            return {"content": [{"type": "text", "text": f"Unknown tool {params.get('name')}"}], "isError": True}
+            return {"content": [{"type": "text", "text": f"Unknown tool {name}"}], "isError": True}
+        driving, note, started = name in DRIVING_TOOLS, None, time.time()
+        if driving:
+            if not LOCK.acquire(LOCK_WAIT):
+                d = read_driver() or {}
+                return {"content": [{"type": "text", "text": (
+                    f"Another chat's server (process {d.get('server_pid')}) has been driving the editor with {d.get('tool')} for more than "
+                    f"{LOCK_WAIT:.0f} s, so {name} was not run. Try again when it is done.")}], "isError": True}
+            note = other_chat_note(read_driver())
+            write_driver(name, started)
         try:
-            res = tool[1](params.get("arguments") or {})
-            if isinstance(res, dict) and "content" in res:
-                return res
-            text, is_error = res if isinstance(res, tuple) else (res, False)
-        except (RemoteError, wininput.WinError) as e:
-            text, is_error = str(e), True
-        except Exception:
-            text, is_error = traceback.format_exc(), True
-        return {"content": [{"type": "text", "text": text}], "isError": bool(is_error)}
+            try:
+                res = tool[1](params.get("arguments") or {})
+                if isinstance(res, dict) and "content" in res:
+                    out = res
+                else:
+                    text, is_error = res if isinstance(res, tuple) else (res, False)
+                    out = {"content": [{"type": "text", "text": text}], "isError": bool(is_error)}
+            except (RemoteError, wininput.WinError) as e:
+                out = {"content": [{"type": "text", "text": str(e)}], "isError": True}
+            except Exception:
+                out = {"content": [{"type": "text", "text": traceback.format_exc()}], "isError": True}
+        finally:
+            if driving:
+                write_driver(name, started, time.time())
+                LOCK.release()
+        if note:                # its own item, so a reply that is JSON stays JSON
+            out["content"].append({"type": "text", "text": note})
+        return out
     if req.get("id") is None:
         return None          # notification
     raise LookupError(method)

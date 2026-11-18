@@ -32,14 +32,34 @@ def local_app_data():
     return Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
 
 
+def data_dir():
+    """This server's own folder on the PC, outside the repo and outside every mod (Upload zips a mod's whole folder)."""
+    return Path(os.environ.get("ABF_MCP_DATA") or (local_app_data() / "abf-mod-editor-mcp"))
+
+
 def bridge_dir():
     """Request/response folder for the file bridge; the editor hook computes the same path."""
     return local_app_data() / "abf-mod-editor-mcp" / "bridge"
 
 
+def driver_file():
+    """Which server process last drove the editor, with which tool and when: every server process reads and writes it."""
+    return data_dir() / "driver.json"
+
+
+def world_backup_dir():
+    """Copies of the editor's test worlds, made before Play In Editor and on request."""
+    return data_dir() / "world-backups"
+
+
 def saved_dir():
     """The cooked editor's Saved folder (logs, config)."""
     return Path(os.environ.get("ABF_EDITOR_SAVED") or (local_app_data() / "AbioticFactor" / "Saved"))
+
+
+def worlds_dir():
+    """The worlds Play In Editor loads and saves: one folder per world."""
+    return saved_dir() / "SaveGames" / "Editor" / "Worlds"
 
 
 def hook_dir():
